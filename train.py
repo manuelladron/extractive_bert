@@ -18,7 +18,7 @@ import datetime
 
 def adaptive_loss(outputs):
     masked_lm_loss = outputs['masked_lm_loss']
-    alignment_loss = outputs['alig_loss']
+    alignment_loss = outputs['doc_story_loss']
     doc_high_alig_loss = outputs['doc_high_loss']
     doc_nmhigh_alig_loss = outputs['doc_nmhigh_loss']
 
@@ -68,9 +68,8 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
 
         self.init_weights()
 
-    def compute_doc_sent_loss(self, prediction_scores, alignment_scores, batch_size, device):
+    def compute_doc_sent_loss(self, prediction_scores, alignment_scores, labels, batch_size, device):
         """Compute Mask Language Model Loss """
-        labels = torch.ones((batch_size, 1)).to(device)
         # Compute masked language loss
         loss_fct = torch.nn.CrossEntropyLoss()  # -100 index = padding token
         masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
@@ -98,6 +97,7 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
             self,
             embeds,
             attention_mask,
+            labels, 
             pos_highlights_ids=None,
             neg_highlights_ids=None,
             device=None
@@ -109,6 +109,8 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
                         batch size, seq length, hidden dim
                 attention_mask
                     batch size, seq length
+                labels: unmasked inputs ids
+                    batch size, seq length, 
                 pos_highlights_ids
                     Unmasked tokenized token ids corresponding to matching highlights
                         batch size, word sequence length
@@ -126,25 +128,27 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
                             return_dict=True)
 
         """ Pooled output is the doc embedding """
-        sequence_output = outputs.last_hidden_state
-        pooled_output = outputs.pooler_output
+        sequence_output = outputs.last_hidden_state # [batch, 512, 768]
+        pooled_output = outputs.pooler_output       # [batch, 768]
 
-        print('sequence output: ', sequence_output.shape)
-        print('pooler output: ', pooled_output.shape)
         # hidden states corresponding to document token
-        doc_output = sequence_output[:, 0, :]
+        doc_output = sequence_output[:, 0, :]   # [batch, 768]
         # hidden states corresponding to the text part
-        text_output = sequence_output[:, 1:, :]
-        print('doc output: ', doc_output.shape)
-        print('text_output: ', text_output.shape)
+        text_output = sequence_output[:, 1:, :] # [batch, 511, 768]
 
         # Predict the masked text tokens and alignment scores (whether embedding of doc + stories match )
         prediction_scores, alignment_scores = self.cls(text_output, pooled_output)
-
-        mlm_loss, alig_loss = self.compute_doc_sent_loss(prediction_scores, alignment_scores, batch_size, device)
-
+        """
+        prediction scores [batch, 511, 30522]
+        alignment scores [batch, 2]
+        """
+        
+        mlm_loss, alig_loss = self.compute_doc_sent_loss(prediction_scores, alignment_scores, labels, batch_size, device)
+        print('mlm loss: ', mlm_loss)
+        print('alig loss: ', alig_loss)
+        
         """2nd PASS FOR DOC - MATCHING HIGHLIGHTS RELATIONSHIP"""
-        outputs = self.bert(inputs_embeds=pos_highlights_ids, return_dict=True)
+        outputs = self.bert(input_ids=pos_highlights_ids, return_dict=True)
 
         """ Pooled output is the [CLS] token """
         pooled_output = outputs.pooler_output
@@ -152,9 +156,10 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
         # Predict the alignment score (whether embedding of doc + highlights match )
         alignment_scores = self.doc_high_alignment(pooled_output)
         doc_high_alig_loss = self.compute_doc_high_loss(alignment_scores, batch_size, device, match=True)
-
+        print('doc high alig loss: ', doc_high_alig_loss)
+        
         """3rd PASS FOR DOC - NON-MATCHING HIGHLIGHTS RELATIONSHIP"""
-        outputs = self.bert(inputs_embeds=embeds, return_dict=True)
+        outputs = self.bert(input_ids=neg_highlights_ids, return_dict=True)
 
         """ Pooled output is the [CLS] token """
         pooled_output = outputs.pooler_output
@@ -162,7 +167,8 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
         # Predict the alignment score (whether embedding of doc + highlights match )
         alignment_scores = self.doc_high_alignment(pooled_output)
         doc_nmhigh_alig_loss = self.compute_doc_high_loss(alignment_scores, batch_size, device, match=False)
-
+        print('doc nmhigh alig loss: ', doc_nmhigh_alig_loss)
+        
         return {
             #"raw_outputs": outputs,
             "masked_lm_loss": mlm_loss,
@@ -183,7 +189,7 @@ def train(extractive_bert, train_set, params, device):
         shuffle=True,
         collate_fn=collate,
     )
-    print('loaded')
+    print('loaded, len dataloader: ', len(dataloader))
     extractive_bert.to(device)
     extractive_bert.train()
     opt = transformers.Adafactor(
@@ -205,12 +211,12 @@ def train(extractive_bert, train_set, params, device):
         for doc_embed, story_ids, story_att_mask, high_ids, neg_high_ids in dataloader:
             opt.zero_grad()
 
-            print('\n-----Shapes---------')
-            print('doc embed: ',doc_embed.shape)     #[batch, 768]
-            print('story ids: ', story_ids.shape)    #[batch, 511]
-            print('attention mask story: ', story_att_mask.shape)  #[batch, 511]
-            print('high ids: ', high_ids.shape)      #[batch, 512]
-            print('neg high ids: ', neg_high_ids.shape) #[ #[batch, 512]
+#             print('\n-----Shapes---------')
+#             print('doc embed: ',doc_embed.shape)     #[batch, 768]
+#             print('story ids: ', story_ids.shape)    #[batch, 511]
+#             print('attention mask story: ', story_att_mask.shape)  #[batch, 511]
+#             print('high ids: ', high_ids.shape)      #[batch, 512]
+#             print('neg high ids: ', neg_high_ids.shape) #[ #[batch, 512]
 
             # mask stories tokens with prob 15%, note id 103 is the [MASK] token
             token_mask = torch.rand(story_ids.shape)
@@ -228,26 +234,29 @@ def train(extractive_bert, train_set, params, device):
             outputs = extractive_bert(
                 embeds=embeds.to(device),
                 attention_mask=attention_mask.to(device),
+                labels = story_ids.to(device),
                 pos_highlights_ids=high_ids.to(device),
                 neg_highlights_ids=neg_high_ids.to(device),
                 device=device
             )
 
             loss = adaptive_loss(outputs)
-
+            print('adaptive loss: ', loss)
             loss.backward()
             opt.step()
             scheduler.step()
-
+            
             for k, v in outputs.items():
                 if k in avg_losses:
                     avg_losses[k].append(v.cpu().item())
             avg_losses["total"].append(loss.cpu().item())
-
-            if ep % 5 == 0 and ep != 0:
-                model_name = f'extractivebert_cnn_epoch_{ep}'
-                ExtractiveBert.save_pretrained(model_name)
-                save_json(f"{model_name}/train_params.json", params.__dict__)
+            print('loop complete')
+            
+        if (ep % 5 == 0 and ep != 0) or ep == params.num_epochs - 1:
+            print('Saving!')
+            model_name = f'extractivebert_cnn_epoch_{ep}'
+            ExtractiveBert.save_pretrained(model_name)
+            save_json(f"{model_name}/train_params.json", params.__dict__)
 
         print("***************************")
         print(f"At epoch {ep + 1}, losses: ")
@@ -272,9 +281,10 @@ if __name__ == '__main__':
     #parser.add_argument('--path_to_images', help='Absolute path to image directory', default='/Users/alexschneidman/Documents/CMU/CMU/F20/777/ADARI/v2/full')
     #parser.add_argument('--path_to_data_dict', help='Absolute path to json containing img name, sentence pair dict', default='/Users/alexschneidman/Documents/CMU/CMU/F20/777/ADARI/ADARI_furniture_pairs.json')
     parser.add_argument('--path_to_dataset', help='Absolute path to .json file',
-                        default='../data/cnn/preprocessed_ourmethod/cnn_train.json')
+                        default='../data/cnn_train.json')
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print('Device: ', device)
     args = parser.parse_args()
     params = TrainParams()
 

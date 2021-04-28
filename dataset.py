@@ -74,15 +74,15 @@ class ExtractiveDataset(Dataset):
         story = sample['story']
         highlights = sample['highlights']
 
-        print('highlights: ')
-        print(highlights)
+#         print('highlights: ')
+#         print(highlights)
 
-        print('embedding doc...')
+#         print('embedding doc...')
         doc_embed = generate_encoding_doc(story, self.tokenizer, self.model)
-        print('getting random sents...')
+#         print('getting random sents...')
         neg_high = get_random_sents(self.all_high, self.num_stories, highlights)
 
-        print('tokenizing...')
+#         print('tokenizing...')
         token_story = []
         token_types_story = []
         att_mask_story = []
@@ -126,11 +126,11 @@ class ExtractiveDataset(Dataset):
         neg_high_ids = torch.LongTensor(token_neg_high[:512]).to(self.device)
         att_mask_story = torch.ones_like(story_ids).to(self.device)
 
-        print('In get item: ')
-        print('doc embed: ', doc_embed.shape)
-        print('story ids: ', story_ids.shape)
-        print('neg_high_ids: ', neg_high_ids.shape)
-        print('att mask story: ', att_mask_story.shape)
+#         print('In get item: ')
+#         print('doc embed: ', doc_embed.shape)
+#         print('story ids: ', story_ids.shape)
+#         print('neg_high_ids: ', neg_high_ids.shape)
+#         print('att mask story: ', att_mask_story.shape)
 
         return doc_embed, story_ids, att_mask_story, high_ids, neg_high_ids
 
@@ -226,38 +226,17 @@ def collate(batch):
     """
     doc_embeds = [item[0] for item in batch]
     doc_embeds = torch.stack(doc_embeds)
-    print('doc embeds shape: ', doc_embeds.shape)
+#     print('doc embeds shape: ', doc_embeds.shape)
 
     story_ids = pad_sequence([item[1] for item in batch], batch_first=True)
     story_att_mask = pad_sequence([item[2] for item in batch], batch_first=True)
     high_ids = pad_sequence([item[3] for item in batch], batch_first=True)
     neg_high_ids = pad_sequence([item[4] for item in batch], batch_first=True)
 
-
-    print('story ids shape: ', story_ids.shape)
-    print('story att mask shape: ', story_att_mask.shape)
-    print('high_ids shape: ', high_ids.shape)
-    print('neg high ids: ', neg_high_ids.shape)
+#     print('story ids shape: ', story_ids.shape)
+#     print('story att mask shape: ', story_att_mask.shape)
+#     print('high_ids shape: ', high_ids.shape)
+#     print('neg high ids: ', neg_high_ids.shape)
 
     return doc_embeds, story_ids, story_att_mask, high_ids, neg_high_ids
 
-
-# path = '/Users/manuelladron/iCloud_archive/Documents/_CMU/PHD-CD/spring2021/11747_neural_networks_for_NLP/project/data/cnn/preprocessed_ourmethod/cnn_train.json'
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-# dataset = ExtractiveDataset(path, device)
-#
-# print('Loading dataset....')
-# dataloader = torch.utils.data.DataLoader(
-#     dataset,
-#     batch_size=2,
-#     shuffle=False,
-#     collate_fn=collate,
-# )
-# print('Dataloader length: ')
-# print(len(dataloader))
-# print('iterating!')
-# i = 0
-#
-# it = iter(dataloader)
-# first = next(it)
-# print('first')

@@ -48,12 +48,12 @@ def construct_bert_input(doc_embed, input_ids, model, device=None):
     #    input_ids.to(device),
     #    token_type_ids=torch.zeros(input_ids.shape, dtype=torch.long).to(device),
     #    position_ids=torch.arange(0, input_ids.shape[1], dtype=torch.long).to(device) * torch.ones(input_ids.shape, dtype=torch.long).to(device))
-
+    doc_embed = doc_embed.to(device)
     inputs_embeddings = model.bert.embeddings(input_ids.to(device)) # [batch, 511, 768]
 
     # For doc embedding
-    doc_position_ids = torch.ones(1, dtype=torch.long) * torch.ones(doc_embed.shape[0], dtype=torch.long) # [1, 1]
-    doc_token_type_ids = torch.ones(doc_embed.shape[0], dtype=torch.long) # [1, 1]
+    doc_position_ids = torch.ones(1, dtype=torch.long).to(device) * torch.ones(doc_embed.shape[0], dtype=torch.long).to(device) # [1, 1]
+    doc_token_type_ids = torch.ones(doc_embed.shape[0], dtype=torch.long).to(device) # [1, 1]
 
     # Get embeddings
     doc_position_embeds = model.bert.embeddings.position_embeddings(doc_position_ids.to(device)) # [batch, 768]
