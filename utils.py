@@ -38,6 +38,13 @@ def save_json(file_path, data):
 def check_tokenize_file(path):
     d = open_json(path)
     print(d[0])
+    
+def check_pkl_file(file):
+    f = open(file, "rb")
+    dataset = pickle.load(f)
+    print('len dataset: ', len(dataset))
+    print('example')
+    print(dataset.iloc[0])
 
 def construct_bert_input(doc_embed, input_ids, model, device=None):
 

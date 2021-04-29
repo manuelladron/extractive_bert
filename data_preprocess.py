@@ -1,31 +1,39 @@
 # Code from https://machinelearningmastery.com/prepare-news-articles-text-summarization/
+
+### multiprocessing dependencies 
 import argparse
 import os
 import string
 import subprocess
 from os import listdir
 from pickle import dump
-from multiprocess import Pool
+from multiprocessing import Pool, set_start_method
+import multiprocessing
 from os.path import join as pjoin
+import glob
+import psutil
+from pathlib import Path
+
+### preprocessing dependencies 
 from tqdm import tqdm
 import torch, torchvision
 import numpy as np
 import pandas as pd
 import pickle
 import gc
-import glob
 import hashlib
 import json
 import xml.etree.ElementTree as ET
 from others.utils import clean
 from prepro.utils import _get_word_ngrams
-# from spacy.lang.en.stop_words import STOP_WORDS
+
+### other libraries 
 import pdb
 import time
 import copy
 import re
 import random
-from utils import open_json, save_json
+from utils import open_json, save_json, check_pkl_file
 
 # load doc into memory
 def load_doc(filename):
@@ -415,7 +423,7 @@ def generate_encoding_doc(story, tokenizer, model):
     doc_embed = sentence_embeds.mean(dim=1).mean(dim=0) # [768]
     return doc_embed
 
-def get_random_sents(all_highlights, num_h,  highlight):
+def get_random_sents(all_highlights, num_h, highlight):
     """
     Recursive function to get negative highlights
     :param all_highlights: all sentences from the dataset
@@ -429,9 +437,191 @@ def get_random_sents(all_highlights, num_h,  highlight):
     neg_high = list(access_map)
     check = any(h in neg_high for h in highlight)
     if check:
-        get_random_sents(all_highlights, highlight)
+        get_random_sents(all_highlights, num_h, highlight)
     return neg_high
 
+
+########## functions for multiprocessing ####################
+def partition_jsons(args):
+    dataset = open_json(args.all_jsons)
+    num_stories = len(dataset)
+    print('num stories: ', num_stories)
+    batch_size = 50
+    num_batches = num_stories // batch_size
+    print('num batches: ', num_batches)
+    
+    for b in range(num_batches):
+        if b%50==0:
+            path = args.save_path + f'batch_{b}'
+            try: 
+                os.mkdir(path) 
+            except OSError as error: 
+                print(error) 
+          
+        name = path + f'/cnn_train_{b}.json'
+        #print('first idx: ', num_batches*b, 'second index: ', num_batches*(b+1))  
+        save_json(name, dataset[batch_size*b : batch_size*(b+1)])
+    print('Done!')
+                  
+class MultiprocessData():
+    def __init__(self, args):
+        self.args = args
+        print('Loading tokenizer and model...')
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.model = BertModel.from_pretrained('bert-base-uncased', return_dict=True, output_hidden_states=True)
+        
+        print('Generating all highlights...')
+        self.allfiles = open_json(args.all_jsons)
+        
+        self.all_high = []
+        for s in self.allfiles:
+            high = s['highlights']  # list with sentences
+            self.all_high += high
+        print('Len all highlights: ', len(self.all_high))
+    
+        # Main directory 
+        root_dir = os.path.dirname(args.save_path)
+        print('MAIN DIR: ', root_dir)
+        f = 0
+        for folder in os.listdir(root_dir):
+            st_ = time.time()
+            folder_name = os.path.join(root_dir, folder)
+            print('------folder: ', folder_name)
+            df = self.pd_wrapper(directory=folder_name , pattern='*.json', processes=-1)
+            df.to_pickle(args.save_dataset + f'cnn_{args.preprocess_mode}_4_dataloader_{folder}.pkl')
+            print('\nSaved df file succesfully')
+            f+=1
+            del df
+            gc.collect()
+            print(f'Time to process folder {f}: {time.time() - st_} s')
+            
+    def get_files(self, directory, pattern):
+        for path in Path(directory).rglob(pattern):
+            yield path.absolute()
+            
+    def print_memory(self):
+        print('cpu %: ', psutil.cpu_percent())
+        vm = dict(psutil.virtual_memory()._asdict())
+        print('virtual memory %: ', psutil.virtual_memory().percent)
+        print('virtual memory aval. %: ', psutil.virtual_memory().available*100 / psutil.virtual_memory().total)
+        
+    def process_file(self, filename):
+        print('filename: ', filename)
+        data = open_json(filename)
+        num_stories = len(data)
+        print('num stories: ', num_stories)
+        df = pd.DataFrame(columns=["id", "doc_embed", "story_ids", "att_mask_story", "high_ids", "neg_high_ids"])
+       
+        for i, sample in enumerate(data):
+            #if i%3 == 0:
+                #continue
+            print(f'sample: {i}/{num_stories}')
+            id_ = sample['id']
+            story = sample['story']
+            highlights = sample['highlights']
+
+            doc_embed = generate_encoding_doc(story, self.tokenizer, self.model)
+            neg_high = get_random_sents(self.all_high, num_stories, highlights)
+
+            # All lists we need
+            token_story = []
+            token_types_story = []
+
+            token_high = []
+            token_types_high = []
+
+            token_neg_high = []
+            token_types_neg_high = []
+
+            for i, s in enumerate(story):
+                tokens = self.tokenizer.encode(s)
+                # tokens = self.tokenizer(s, max_length=511, truncation=True, padding = 'max_length', return_tensors = 'pt')
+                token_story += tokens
+                if i%2 == 0:
+                    types = [0] * len(tokens)
+                else:
+                    types = [1] * len(tokens)
+                token_types_story += types
+
+            for i, h in enumerate(highlights):
+                tokens = self.tokenizer.encode(h)
+                token_high += tokens
+                if i%2 == 0:
+                    types = [0] * len(tokens)
+                else:
+                    types = [1] * len(tokens)
+                token_types_high += types
+
+            for i, nh in enumerate(neg_high):
+                tokens = self.tokenizer.encode(nh)
+                token_neg_high += tokens
+                if i%2 == 0:
+                    types = [0] * len(tokens)
+                else:
+                    types = [1] * len(tokens)
+                token_types_neg_high += types
+
+            story_ids = torch.LongTensor(token_story[:511])
+            high_ids = torch.LongTensor(token_high[:512])
+            neg_high_ids = torch.LongTensor(token_neg_high[:512])
+            att_mask_story = torch.ones_like(story_ids)
+
+            df=df.append({'id': id_,
+                            'doc_embed': doc_embed.detach().cpu().numpy(),
+                            'story_ids': story_ids.detach().cpu().numpy(),
+                            'att_mask_story': att_mask_story.detach().cpu().numpy(),
+                            'high_ids': high_ids.detach().cpu().numpy(),
+                            'neg_high_ids': neg_high_ids.detach().cpu().numpy()
+                         },ignore_index=True)
+            del story_ids
+            del high_ids
+            del neg_high_ids
+            del att_mask_story
+            del doc_embed
+            del neg_high
+
+            gc.collect()
+            self.print_memory()
+            
+        print('\nReturning dataframe')
+        return df
+    
+    def pd_wrapper(self, directory, pattern, processes=-1):
+        # Decide how many proccesses will be created
+        sum_size = 0
+        if processes <=0:
+            num_cpus = psutil.cpu_count(logical=False)
+        else:
+            num_cpus = processes
+        print('num cpus: ', num_cpus)
+        
+        files = []
+        # Get files based on pattern and their sum of size
+        for file in self.get_files(directory=directory, pattern=pattern):
+            sum_size = sum_size + os.path.getsize(file)
+            files.append(file)
+        
+        print('files:%s,size:%s bytes, procs:%s'%(len(files),sum_size,num_cpus))
+        # Create the pool
+        with get_context('spawn').Pool(processes=num_cpus) as process_pool:
+            #process_pool = Pool(processes=num_cpus)
+            print('process pool: ', process_pool)
+            start = time.time()
+            # Start processes in the pool
+            dfs = process_pool.map(self.process_file, files)
+            print('process pool finished')
+            # Concat dataframes to one dataframe
+            process_pool.close()
+            process_pool.join()
+            print('concatenating pandas')
+            data = pd.concat(dfs, ignore_index=True)
+            end = time.time()
+            print('Completed in: %s sec'%(end - start))
+
+        return data
+
+    
+###############################################################        
 def preprocess_dataloader(args):
 
     # Open dataset
@@ -508,7 +698,7 @@ def preprocess_dataloader(args):
                             'high_ids': high_ids,
                             'neg_high_ids': neg_high_ids},ignore_index=True)
 
-        df.to_pickle(args.save_path + f'cnn_train_{args.preprocess_mode}_4_dataloader.pkl')
+    df.to_pickle(args.save_path + f'cnn_train_{args.preprocess_mode}_4_dataloader.pkl')
 
 
 def create_parser():
@@ -517,16 +707,21 @@ def create_parser():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--raw_dataset', type=str, default='../data/cnn/stories', help='Path to dataset')
-    parser.add_argument('--save_dataset', type=str, default='../data/cnn/preprocessed_ourmethod', help='Path to save '
+    parser.add_argument('--save_dataset', type=str, default='../data/', help='Path to save '
     																							 'preprocessed dataset')
 
     parser.add_argument('--preprocessed_dataset', type=str,
                         default='../data/cnn/preprocessed_ourmethod/cnn_dataset_preprocessed.pkl',
                         help='Path to dataset')
 
-    parser.add_argument('--save_path', type=str, default='../data/cnn/preprocessed_ourmethod/',
+    parser.add_argument('--save_path', type=str, default='../data/all_jsons/',
                         help='Path to save preprocessed dataset')
-    parser.add_argument('--load_json', default='../data/cnn/preprocessed_ourmethod/cnn_train_wid.json', type=str)
+    
+    parser.add_argument('--all_jsons', default='../data/cnn_train_wid.json', type=str)
+    parser.add_argument('--load_json', default='../data/test', type=str)
+    parser.add_argument('--load_pkl', default='../data/cnn_train_4_dataloader.pkl', type=str)
+    
+    
     parser.add_argument('--preprocess_mode', default='train', type=str)
     parser.add_argument("--shard_size", default=2000, type=int)
     parser.add_argument('--min_src_nsents', default=3, type=int)
@@ -542,6 +737,9 @@ def create_parser():
 
 
 if __name__ == "__main__":
+    set_start_method('spawn')
+    from multiprocessing import get_context
+    
     args = create_parser()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     # load stories
@@ -561,7 +759,13 @@ if __name__ == "__main__":
     # check_tokenize_file(path)
     #clean_and_save_dataset(args.preprocessed_dataset, args.save_dataset_c)
     #select_source_sents_and_partition_dataset(args.preprocessed_dataset, args)
-    preprocess_dataloader(args)
+#     preprocess_dataloader(args)
+#     partition_jsons(args)
+    M = MultiprocessData(args)
+#     df = M.pd_wrapper(directory=args.load_json, pattern='*.json')
+#     df.to_pickle(args.save_dataset + f'cnn_{args.preprocess_mode}_4_dataloader.pkl')
+    #check_pkl_file(args.load_pkl)
+
     print('time: ', time.time()-st)
 
     #save to file
