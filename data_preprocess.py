@@ -7,7 +7,10 @@ from os import listdir
 from pickle import dump
 from multiprocess import Pool
 from os.path import join as pjoin
+from tqdm import tqdm
 import torch, torchvision
+import numpy as np
+import pandas as pd
 import pickle
 import gc
 import glob
@@ -22,7 +25,7 @@ import time
 import copy
 import re
 import random
-from utils import save_json
+from utils import open_json, save_json
 
 # load doc into memory
 def load_doc(filename):
@@ -34,7 +37,6 @@ def load_doc(filename):
     file.close()
     return text
 
-
 # split a document into news story and highlights
 def split_story(doc):
     # find first highlight
@@ -44,7 +46,6 @@ def split_story(doc):
     # strip extra white space around each highlight
     highlights = [h.strip() for h in highlights if len(h) > 0]
     return story, highlights
-
 
 # load all stories in a directory
 def load_stories(directory):
@@ -58,7 +59,6 @@ def load_stories(directory):
         # store
         stories.append({'story': story, 'highlights': highlights})
     return stories
-
 
 # clean a list of lines
 def clean_lines(lines):
@@ -335,6 +335,7 @@ def select_source_sents_and_partition_dataset(dataset_path, args):
 
     story_s = []
     empty_stories = 0
+    i = 0
     for sample in dataset:
         story = sample['story']
         highlights = sample['highlights']
@@ -363,9 +364,11 @@ def select_source_sents_and_partition_dataset(dataset_path, args):
         sorted_story += [sent for sent in _story]
         sorted_story = sorted_story[:args.max_src_nsents]
 
-        new_sample = {'story': sorted_story,
+        new_sample = {'id': i,
+                      'story': sorted_story,
                       'highlights': highlights}
         story_s.append(new_sample)
+        i+=1
 
     print('empty stories: ', empty_stories)
     random.shuffle(story_s)
@@ -382,12 +385,131 @@ def select_source_sents_and_partition_dataset(dataset_path, args):
     print(train_set[0])
 
     print('---Saving sets----')
-    save_json(args.save_path + 'cnn_train.json', train_set)
-    save_json(args.save_path + 'cnn_test.json', test_set)
-    save_json(args.save_path + 'cnn_val.json', validation_set)
+    save_json(args.save_path + 'cnn_train_wid.json', train_set)
+    save_json(args.save_path + 'cnn_test_wid.json', test_set)
+    save_json(args.save_path + 'cnn_val_wid.json', validation_set)
     print('Saved in: ', args.save_path)
 
     return train_set, validation_set, test_set
+
+####### FROM HERE WE WORK ON PREPROCESSING DATASET FROM JSON TO DATALOADER ############
+
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+import torch, torchvision
+import transformers
+from transformers import BertTokenizer, BertModel
+
+
+def generate_encoding_doc(story, tokenizer, model):
+    """
+    :param story: list with sentences corresponding to 1 story
+    :return: contextual representation BERT
+    """
+    batch_sents = tokenizer(story, padding=True, truncation=True, return_tensors='pt')
+    output = model(batch_sents['input_ids'])
+    all_hidden = output[2]  # tuple
+    all_hidden_pt = torch.stack(all_hidden)  # [13, batch, seq_len, 768]
+    # Use second to last layer as embedding
+    sentence_embeds = all_hidden_pt[-2, :, :] # [batch, seq_len, 768]
+    doc_embed = sentence_embeds.mean(dim=1).mean(dim=0) # [768]
+    return doc_embed
+
+def get_random_sents(all_highlights, num_h,  highlight):
+    """
+    Recursive function to get negative highlights
+    :param all_highlights: all sentences from the dataset
+    :param num_h: length of all_highlights
+    :param highlight: current highlight of a particular story
+    :return: list with negative highlights
+    """
+    num_pos_h = len(highlight) # Current story's highlights
+    rand_idxs = np.random.choice(num_h, num_pos_h)
+    access_map = map(all_highlights.__getitem__, rand_idxs)
+    neg_high = list(access_map)
+    check = any(h in neg_high for h in highlight)
+    if check:
+        get_random_sents(all_highlights, highlight)
+    return neg_high
+
+def preprocess_dataloader(args):
+
+    # Open dataset
+    dataset = open_json(args.load_json)
+    num_stories = len(dataset)
+
+    # Set up tokenizer and model
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = BertModel.from_pretrained('bert-base-uncased', return_dict=True, output_hidden_states=True)
+
+    # Get all highlights
+    all_high = []
+    for s in dataset:
+        high = s['highlights']  # list with sentences
+        all_high += high
+
+
+    df = pd.DataFrame(columns=["id", "doc_embed", "story_ids", "att_mask_story", "high_ids", "neg_high_ids"])
+    for sample in tqdm(dataset):
+        id = sample['id']
+        story = sample['story']
+        highlights = sample['highlights']
+
+        doc_embed = generate_encoding_doc(story, tokenizer, model)
+        neg_high = get_random_sents(all_high, num_stories, highlights)
+
+        # All lists we need
+        token_story = []
+        token_types_story = []
+
+        token_high = []
+        token_types_high = []
+
+        token_neg_high = []
+        token_types_neg_high = []
+
+        for i, s in enumerate(story):
+            tokens = tokenizer.encode(s)
+            # tokens = self.tokenizer(s, max_length=511, truncation=True, padding = 'max_length', return_tensors = 'pt')
+            token_story += tokens
+            if i%2 == 0:
+                types = [0] * len(tokens)
+            else:
+                types = [1] * len(tokens)
+            token_types_story += types
+
+        for i, h in enumerate(highlights):
+            tokens = tokenizer.encode(h)
+            token_high += tokens
+            if i%2 == 0:
+                types = [0] * len(tokens)
+            else:
+                types = [1] * len(tokens)
+            token_types_high += types
+
+        for i, nh in enumerate(neg_high):
+            tokens = tokenizer.encode(nh)
+            token_neg_high += tokens
+            if i%2 == 0:
+                types = [0] * len(tokens)
+            else:
+                types = [1] * len(tokens)
+            token_types_neg_high += types
+
+        story_ids = torch.LongTensor(token_story[:511])
+        high_ids = torch.LongTensor(token_high[:512])
+        neg_high_ids = torch.LongTensor(token_neg_high[:512])
+        att_mask_story = torch.ones_like(story_ids)
+
+        df=df.append({'id': id,
+                            'doc_embed': doc_embed,
+                            'story_ids': story_ids,
+                            'att_mask_story': att_mask_story,
+                            'high_ids': high_ids,
+                            'neg_high_ids': neg_high_ids},ignore_index=True)
+
+        df.to_pickle(args.save_path + f'cnn_train_{args.preprocess_mode}_4_dataloader.pkl')
+
 
 def create_parser():
     """Creates a parser for command-line arguments.
@@ -401,8 +523,11 @@ def create_parser():
     parser.add_argument('--preprocessed_dataset', type=str,
                         default='../data/cnn/preprocessed_ourmethod/cnn_dataset_preprocessed.pkl',
                         help='Path to dataset')
+
     parser.add_argument('--save_path', type=str, default='../data/cnn/preprocessed_ourmethod/',
                         help='Path to save preprocessed dataset')
+    parser.add_argument('--load_json', default='../data/cnn/preprocessed_ourmethod/cnn_train_wid.json', type=str)
+    parser.add_argument('--preprocess_mode', default='train', type=str)
     parser.add_argument("--shard_size", default=2000, type=int)
     parser.add_argument('--min_src_nsents', default=3, type=int)
     parser.add_argument('--max_src_nsents', default=100, type=int)
@@ -435,7 +560,8 @@ if __name__ == "__main__":
     # /project/data/cnn/preprocessed_lines/.test.0.json'
     # check_tokenize_file(path)
     #clean_and_save_dataset(args.preprocessed_dataset, args.save_dataset_c)
-    select_source_sents_and_partition_dataset(args.preprocessed_dataset, args)
+    #select_source_sents_and_partition_dataset(args.preprocessed_dataset, args)
+    preprocess_dataloader(args)
     print('time: ', time.time()-st)
 
     #save to file
