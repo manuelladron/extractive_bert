@@ -487,6 +487,7 @@ class MultiprocessData():
             st_ = time.time()
             folder_name = os.path.join(root_dir, folder)
             print('------folder: ', folder_name)
+            self.print_memory()
             df = self.pd_wrapper(directory=folder_name , pattern='*.json', processes=-1)
             df.to_pickle(args.save_dataset + f'cnn_{args.preprocess_mode}_4_dataloader_{folder}.pkl')
             print('\nSaved df file succesfully')
@@ -579,9 +580,8 @@ class MultiprocessData():
             del att_mask_story
             del doc_embed
             del neg_high
-
             gc.collect()
-            self.print_memory()
+            
             
         print('\nReturning dataframe')
         return df
@@ -707,17 +707,17 @@ def create_parser():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--raw_dataset', type=str, default='../data/cnn/stories', help='Path to dataset')
-    parser.add_argument('--save_dataset', type=str, default='../data/', help='Path to save '
+    parser.add_argument('--save_dataset', type=str, default='../data/cnn_final/', help='Path to save '
     																							 'preprocessed dataset')
 
     parser.add_argument('--preprocessed_dataset', type=str,
                         default='../data/cnn/preprocessed_ourmethod/cnn_dataset_preprocessed.pkl',
                         help='Path to dataset')
 
-    parser.add_argument('--save_path', type=str, default='../data/all_jsons/',
+    parser.add_argument('--save_path', type=str, default='../data/cnn_final/all_jsons/',
                         help='Path to save preprocessed dataset')
     
-    parser.add_argument('--all_jsons', default='../data/cnn_train_wid.json', type=str)
+    parser.add_argument('--all_jsons', default='../data/cnn_final/cnn_train_wid.json', type=str)
     parser.add_argument('--load_json', default='../data/test', type=str)
     parser.add_argument('--load_pkl', default='../data/cnn_train_4_dataloader.pkl', type=str)
     
