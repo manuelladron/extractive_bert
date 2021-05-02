@@ -46,6 +46,7 @@ def check_pkl_file(file):
     print('len dataset: ', len(dataset))
     print('example')
     print(dataset.iloc[0])
+<<<<<<< HEAD
     
 def print_memory():
     print('cpu %: ', psutil.cpu_percent())
@@ -53,6 +54,8 @@ def print_memory():
     print('virtual memory %: ', psutil.virtual_memory().percent)
     print('virtual memory aval. %: ', psutil.virtual_memory().available*100 / psutil.virtual_memory().total)
         
+=======
+>>>>>>> fd9ca4decb8538768f9936453e74edb228c081d6
 
 def construct_bert_input(doc_embed, input_ids, model, device=None):
 
