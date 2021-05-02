@@ -18,6 +18,7 @@ import numpy as np
 import copy
 import pdb
 import random
+import psutil
 
 from others.utils import clean
 from prepro.utils import _get_word_ngrams
@@ -38,6 +39,20 @@ def save_json(file_path, data):
 def check_tokenize_file(path):
     d = open_json(path)
     print(d[0])
+    
+def check_pkl_file(file):
+    f = open(file, "rb")
+    dataset = pickle.load(f)
+    print('len dataset: ', len(dataset))
+    print('example')
+    print(dataset.iloc[0])
+    
+def print_memory():
+    print('cpu %: ', psutil.cpu_percent())
+    vm = dict(psutil.virtual_memory()._asdict())
+    print('virtual memory %: ', psutil.virtual_memory().percent)
+    print('virtual memory aval. %: ', psutil.virtual_memory().available*100 / psutil.virtual_memory().total)
+        
 
 def construct_bert_input(doc_embed, input_ids, model, device=None):
 
@@ -49,6 +64,10 @@ def construct_bert_input(doc_embed, input_ids, model, device=None):
     #    token_type_ids=torch.zeros(input_ids.shape, dtype=torch.long).to(device),
     #    position_ids=torch.arange(0, input_ids.shape[1], dtype=torch.long).to(device) * torch.ones(input_ids.shape, dtype=torch.long).to(device))
     doc_embed = doc_embed.to(device)
+
+    #input_ids = input_ids[:, :511]
+    if torch.min(input_ids) < 0:
+        input_ids = torch.clamp(input_ids, min=0)
     inputs_embeddings = model.bert.embeddings(input_ids.to(device)) # [batch, 511, 768]
 
     # For doc embedding

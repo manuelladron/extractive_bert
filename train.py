@@ -5,55 +5,91 @@ import torch.nn.functional as F
 import PIL
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
+import torch.autograd.profiler as profiler
 import transformers
 from transformers import AdamW
 from transformers import BertTokenizer, BertModel
-from transformers.models.bert.modeling_bert import BertPreTrainingHeads
+from transformers.models.bert.modeling_bert import BertPreTrainingHeads, BertOnlyMLMHead
 from utils import construct_bert_input, save_json
 from transformers import get_linear_schedule_with_warmup
-from dataset import ExtractiveDataset, collate
-
+from dataset import ExtractiveDataset, new_collate, load_dataset, DataloaderMultiple, LazyDataset
+from tqdm import tqdm
+import glob
+import pdb
+torch.set_printoptions(threshold=10_000) # to print full tensor
 import argparse
 import datetime
+import gc
+import psutil
+from utils import print_memory
+torch.autograd.set_detect_anomaly(True)
 
 def adaptive_loss(outputs):
-    masked_lm_loss = outputs['masked_lm_loss']
-    alignment_loss = outputs['doc_story_loss']
+    #masked_lm_loss = outputs['masked_lm_loss']
+    sent_pred_loss = outputs['sent_pred_loss']
+    doc_story_alig_loss = outputs['doc_story_loss']
     doc_high_alig_loss = outputs['doc_high_loss']
     doc_nmhigh_alig_loss = outputs['doc_nmhigh_loss']
 
-    G = torch.stack([masked_lm_loss, alignment_loss, doc_high_alig_loss, doc_nmhigh_alig_loss])  #[4]
+    G = torch.stack([sent_pred_loss, doc_story_alig_loss, doc_high_alig_loss, doc_nmhigh_alig_loss])  #[5]
+    #G = torch.stack([masked_lm_loss, sent_pred_loss, doc_story_alig_loss, doc_high_alig_loss, doc_nmhigh_alig_loss])  #[5]
     w0 = 1.0
     w1 = 1.0
     w2 = 1.0
     w3 = 1.0
+    #w4 = 1.0
+    
     isAdaptive = True
     if isAdaptive:
         logits = torch.nn.Softmax(dim=0)(G)
         nG = logits * logits
         alpha = 1.0
-        K = 4.0
+        K = 5.0
+#         denominator = (alpha * K - nG[0]) * (alpha * K - nG[1]) + (alpha * K - nG[1]) * (alpha * K - nG[2]) + (
+#                     alpha * K - nG[2]) * (alpha * K - nG[3]) + (alpha * K - nG[3]) * (alpha * K - nG[4]) + (alpha * K - nG[4]) * (alpha * K - nG[0])
         denominator = (alpha * K - nG[0]) * (alpha * K - nG[1]) + (alpha * K - nG[1]) * (alpha * K - nG[2]) + (
                     alpha * K - nG[2]) * (alpha * K - nG[3]) + (alpha * K - nG[3]) * (alpha * K - nG[0])
-        w0 = (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3]) / denominator
-        w1 = (alpha * K - nG[2]) * (alpha * K - nG[0]) * (alpha * K - nG[3]) / denominator
-        w2 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[3]) / denominator
-        w3 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2]) / denominator
+        
+        
+        w0 = (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3])  / denominator
+        w1 = (alpha * K - nG[2]) * (alpha * K - nG[0]) * (alpha * K - nG[3])  / denominator
+        w2 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[3])  / denominator
+        w3 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2])  / denominator
 
-    adaptive_loss = w0 * masked_lm_loss + w1 * alignment_loss + w2 * doc_high_alig_loss + w3 * doc_nmhigh_alig_loss
+        
+        
+#         w0 = (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3]) * (alpha * K - nG[4]) / denominator
+#         w1 = (alpha * K - nG[2]) * (alpha * K - nG[0]) * (alpha * K - nG[3]) * (alpha * K - nG[4]) / denominator
+#         w2 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[3]) * (alpha * K - nG[4]) / denominator
+#         w3 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[4]) / denominator
+#         w4 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3]) / denominator
+
+#     adaptive_loss = w0 * masked_lm_loss + w1 * sent_pred_loss + w2 * doc_story_alig_loss + w3 * doc_high_alig_loss + w4 * doc_nmhigh_alig_loss
+        adaptive_loss = w0 * sent_pred_loss + w1 * doc_story_alig_loss + w2 * doc_high_alig_loss + w3 * doc_nmhigh_alig_loss
 
     return adaptive_loss
 
-class ExtractiveBertHead(torch.nn.Module):
+class AlignmentHead(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.alig = torch.nn.Linear(config.hidden_size, 2)
+
+    def forward(self, doc_token):
+        alig_score = self.alig(doc_token)
+        return alig_score
+    
+class AlignmentPredictionHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.seq_relationship = torch.nn.Linear(config.hidden_size, 2)
-
-    def forward(self, pooled_output):
-        seq_relationship_score = self.seq_relationship(pooled_output)
-        return seq_relationship_score
-
-
+        self.alig = torch.nn.Linear(config.hidden_size, 2)
+        
+    def forward(self, sentence_output, doc_output):
+        sent_pred_score = self.seq_relationship(sentence_output)
+        alig_score = self.alig(doc_output)
+        
+        return sent_pred_score, alig_score
+    
 class ExtractiveBert(transformers.BertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -62,26 +98,45 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
 
         self.im_to_embedding = torch.nn.Linear(2048, 768)
         self.im_to_embedding_norm = torch.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-        self.cls = BertPreTrainingHeads(config)
-        self.doc_high_alignment = ExtractiveBertHead(config)
+        
+        self.mlm = BertOnlyMLMHead(config)
+        self.alig_pred = AlignmentPredictionHead(config)
+        self.alignment = AlignmentHead(config)
 
         self.init_weights()
-
-    def compute_doc_sent_loss(self, prediction_scores, alignment_scores, labels, batch_size, device):
-        """Compute Mask Language Model Loss """
-        # Compute masked language loss
-        loss_fct = torch.nn.CrossEntropyLoss()  # -100 index = padding token
+    
+    def compute_mlm_loss(self, prediction_scores, labels):
+        loss_fct = torch.nn.CrossEntropyLoss() # -100 ignore index 
         masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+        return masked_lm_loss
+    
+    
+    def compute_doc_sent_loss(self, doc_alig, sent_pred, labels, mask, batch_size, device):
+        """Compute Sentence Prediction """
+        ### Shapes
+        #doc alig: [batch, 2]
+        #sent pred: [batch, 512, 2]
+        #labels: [batch, 512]
+        #mask: [batch, 512]
+       
+        #loss_fct = torch.nn.BCEWithLogitsLoss(reduction='none') 
+        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+        pred_loss = loss_fct(sent_pred.view(-1, 2), labels.long().view(-1)) # [batch*512]
 
+        pred_loss = pred_loss.view(batch_size, -1)
+        pred_loss *= mask
+        pred_loss = pred_loss.mean()
+        #print('pred loss: ', pred_loss)
+        
         """Compute Doc - Stories Alignment """
         loss_fct = torch.nn.CrossEntropyLoss()
         is_paired = torch.ones((batch_size, 1)).to(device)
-        alignment_loss = loss_fct(alignment_scores.view(-1, 2), is_paired.long().view(-1))
+        alignment_loss = loss_fct(doc_alig.view(-1, 2), is_paired.long().view(-1))
+        #print('alignmet loss: ', alignment_loss)
 
-        return masked_lm_loss, alignment_loss
+        return pred_loss, alignment_loss
 
-    def compute_doc_high_loss(self, alignment_scores, batch_size, device, match=True):
+    def compute_doc_alig_loss(self, alignment_scores, batch_size, device, match=True):
         """Compute Doc - Stories Alignment """
         loss_fct = torch.nn.CrossEntropyLoss()
         if match:
@@ -95,16 +150,25 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
 
     def forward(
             self,
-            embeds,
-            attention_mask,
-            labels, 
-            pos_highlights_ids=None,
-            neg_highlights_ids=None,
+            stories_mlm, # [batch, 511]
+            labels_lm,   # [batch, 511]
+            doc_story,   # [batch, 512, 768]
+            doc_high,    # [batch, seq_len, 768]
+            doc_nonhigh, # [batch, seq_len, 768]
+            story_mask,  # [batch, 511]
+            doc_story_mask,
+            doc_high_mask,
+            doc_nonhigh_mask,
+            stories,     # [batch, 511]
+            stories_cls_tokens_mask,  # [batch, seq_len]
+            pos_high_cls_tokens_mask, # [batch, seq_len]
+            neg_highl_cls_tokens_mask,# [batch, seq_len]
             device=None
+
     ):
         """
             Args:
-                embeds
+                doc_story
                     hidden embeddings to pass to the bert model
                         batch size, seq length, hidden dim
                 attention_mask
@@ -118,77 +182,98 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
                     Unmasked tokenized token ids corresponding to random non-matching highlights
                         batch size, word sequence length
         """
-        batch_size = embeds.shape[0]
-        seq_length = embeds.shape[1]
-        hidden_dim = embeds.shape[2]
+#         print('stories_mlm: ', stories_mlm.shape)
+#         print('doc_story: ', doc_story.shape)
+#         print('doc_high: ', doc_high.shape)
+#         print('doc_nonhigh: ', doc_nonhigh.shape)
+#         print('story_mask: ', story_mask.shape)
+#         print('story: ', stories.shape)
+#         print('labels: ', labels_lm.shape)
+        
+        batch_size = doc_story.shape[0]
+        seq_length = doc_story.shape[1]
+        hidden_dim = doc_story.shape[2]
+        
+        """1st PASS FOR LANGUAGE MODELING"""
+#         outputs = self.bert(input_ids=stories_mlm, attention_mask=story_mask, return_dict=True)
+#         sequence_output = outputs.last_hidden_state # [batch, 512, 768]
+        
+#         # Only MLM loss 
+#         mlm_scores = self.mlm(sequence_output) # mlm scores [batch, 511, 30522]
+#         mlm_loss = self.compute_mlm_loss(mlm_scores, labels_lm)
 
-        """1st PASS FOR DOC - STORY RELATIONSHIP"""
-        outputs = self.bert(inputs_embeds=embeds,
-                            attention_mask=attention_mask,
+        """2nd PASS FOR DOC - STORY RELATIONSHIP"""
+        #with profiler.profile(with_stack=True, profile_memory=True) as prof:
+        outputs = self.bert(inputs_embeds=doc_story,
+                            attention_mask=doc_story_mask,
                             return_dict=True)
-
-        """ Pooled output is the doc embedding """
+        
         sequence_output = outputs.last_hidden_state # [batch, 512, 768]
-        pooled_output = outputs.pooler_output       # [batch, 768]
-
-        # hidden states corresponding to document token
-        doc_output = sequence_output[:, 0, :]   # [batch, 768]
-        # hidden states corresponding to the text part
-        text_output = sequence_output[:, 1:, :] # [batch, 511, 768]
-
-        # Predict the masked text tokens and alignment scores (whether embedding of doc + stories match )
-        prediction_scores, alignment_scores = self.cls(text_output, pooled_output)
-        """
-        prediction scores [batch, 511, 30522]
-        alignment scores [batch, 2]
-        """
+        doc_output = sequence_output[:, 0, :]
         
-        mlm_loss, alig_loss = self.compute_doc_sent_loss(prediction_scores, alignment_scores, labels, batch_size, device)
-        print('mlm loss: ', mlm_loss)
-        print('alig loss: ', alig_loss)
+        # Mask all tokens that are not [CLS] to calculate alignment loss
+        sequence_output_ = torch.clone(sequence_output).detach()
+        sequence_output_[stories_cls_tokens_mask==0] = -100
+        indices=torch.nonzero(sequence_output_[:, :, 0]>-100) # [variable_num, batch_size]
+        seq_len = sequence_output.shape[1]
+        labels = torch.zeros((batch_size, seq_len), dtype=torch.long).to(device)
         
-        """2nd PASS FOR DOC - MATCHING HIGHLIGHTS RELATIONSHIP"""
-        outputs = self.bert(input_ids=pos_highlights_ids, return_dict=True)
+        for i in range(batch_size):
+            # first get the indices corresponding to each batch
+            indices_b = indices[indices[:, 0]==i] 
+            # Now set labels of the first 4 sentences in each batch to 1.  
+            labels[i,:][indices_b[:4, 1]] = 1
+        
+        sent_pred, doc_alig_pred = self.alig_pred(sequence_output, doc_output) #[2, 512, 2] and [2, 512]
+        sent_loss, doc_story_alig_loss = self.compute_doc_sent_loss(doc_alig_pred, sent_pred, labels, stories_cls_tokens_mask, batch_size, device)
 
-        """ Pooled output is the [CLS] token """
-        pooled_output = outputs.pooler_output
+        
+        """3rd PASS FOR DOC - MATCHING HIGHLIGHTS RELATIONSHIP"""
+        outputs = self.bert(inputs_embeds=doc_high, attention_mask=doc_high_mask, return_dict=True)
+        doc_output = sequence_output[:, 0, :]
+        
+        doc_high_alig_score = self.alignment(doc_output)
+        doc_high_alig_loss = self.compute_doc_alig_loss(doc_high_alig_score, batch_size, device, match=True)
 
+        
+        """4th PASS FOR DOC - NON-MATCHING HIGHLIGHTS RELATIONSHIP"""
+        outputs = self.bert(inputs_embeds=doc_nonhigh, attention_mask=doc_nonhigh_mask, return_dict=True)
+        doc_output = sequence_output[:, 0, :]
+        
         # Predict the alignment score (whether embedding of doc + highlights match )
-        alignment_scores = self.doc_high_alignment(pooled_output)
-        doc_high_alig_loss = self.compute_doc_high_loss(alignment_scores, batch_size, device, match=True)
-        print('doc high alig loss: ', doc_high_alig_loss)
+        doc_nonhigh_alig_score = self.alignment(doc_output)
+        doc_nonhigh_alig_loss = self.compute_doc_alig_loss(doc_nonhigh_alig_score, batch_size, device, match=False)
+        #print('doc nmhigh alig loss: ', doc_nmhigh_alig_loss)
         
-        """3rd PASS FOR DOC - NON-MATCHING HIGHLIGHTS RELATIONSHIP"""
-        outputs = self.bert(input_ids=neg_highlights_ids, return_dict=True)
-
-        """ Pooled output is the [CLS] token """
-        pooled_output = outputs.pooler_output
-
-        # Predict the alignment score (whether embedding of doc + highlights match )
-        alignment_scores = self.doc_high_alignment(pooled_output)
-        doc_nmhigh_alig_loss = self.compute_doc_high_loss(alignment_scores, batch_size, device, match=False)
-        print('doc nmhigh alig loss: ', doc_nmhigh_alig_loss)
         
         return {
             #"raw_outputs": outputs,
-            "masked_lm_loss": mlm_loss,
-            "doc_story_loss": alig_loss,
+            #"masked_lm_loss": mlm_loss,
+            "sent_pred_loss":sent_loss,
+            "doc_story_loss": doc_story_alig_loss,
             "doc_high_loss": doc_high_alig_loss,
-            "doc_nmhigh_loss": doc_nmhigh_alig_loss
+            "doc_nmhigh_loss": doc_nonhigh_alig_loss
         }
 
 
 def train(extractive_bert, train_set, params, device):
     torch.manual_seed(0)
-
-    dataset = ExtractiveDataset(train_set, device)
-    print('loading data loader..')
+    root = '../data/batches_processed/'
+    print('---Loading files...')
+    files = sorted(glob.glob(root + 'cnn_train_4_dataloader_batch_' + '[0-9]*.pkl'))
+    datasets = list(map(lambda x : LazyDataset(x), files))
+    dataset = torch.utils.data.ConcatDataset(datasets)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=params.batch_size,
         shuffle=True,
-        collate_fn=collate,
+        collate_fn=new_collate,
     )
+    del dataset
+    del datasets
+    del files 
+    gc.collect()
+
     print('loaded, len dataloader: ', len(dataloader))
     extractive_bert.to(device)
     extractive_bert.train()
@@ -205,69 +290,154 @@ def train(extractive_bert, train_set, params, device):
 
     scheduler = get_linear_schedule_with_warmup(opt, params.num_warmup_steps, params.num_epochs * len(dataloader))
 
-    for ep in range(params.num_epochs):
-        print('epoch: ', ep)
-        avg_losses = {"masked_lm_loss": [], "masked_patch_loss": [], "alignment_loss": [], "total": []}
-        for doc_embed, story_ids, story_att_mask, high_ids, neg_high_ids in dataloader:
-            opt.zero_grad()
+    with torch.profiler.profile(
+    schedule=torch.profiler.schedule(
+        wait=2,
+        warmup=2,
+        active=6,
+        repeat=1),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/extractivebert'),
+    ) as profiler:
+        for ep in range(params.num_epochs):
+            print('epoch: ', ep)
+                        
+            avg_losses = {"masked_lm_loss": [], "sent_pred_loss": [], "doc_story_loss": [], "doc_high_loss": [], "doc_nmhigh_loss": [], "total":[]}
+            i = 0
+            for ids, doc_embed, story_ids, story_att_mask, high_ids, neg_high_ids in tqdm(dataloader):
+                opt.zero_grad()
 
-#             print('\n-----Shapes---------')
-#             print('doc embed: ',doc_embed.shape)     #[batch, 768]
-#             print('story ids: ', story_ids.shape)    #[batch, 511]
-#             print('attention mask story: ', story_att_mask.shape)  #[batch, 511]
-#             print('high ids: ', high_ids.shape)      #[batch, 512]
-#             print('neg high ids: ', neg_high_ids.shape) #[ #[batch, 512]
+    #             print('\n-----Shapes---------')
+    #             print('doc embed: ',doc_embed.shape)     #[batch, 768]
+    #             print('story ids: ', story_ids.shape)    #[batch, 511]
+    #             print('attention mask story: ', story_att_mask.shape)  #[batch, 511]
+    #             print('high ids: ', high_ids.shape)      #[batch, 512]
+    #             print('neg high ids: ', neg_high_ids.shape) #[ #[batch, 512]
+                
+                ## FOR LML LOSS, mask tokens and pass in to BERT model 
+                # mask stories tokens with prob 15%, note id 103 is the [MASK] token
+                token_mask = torch.rand(story_ids.shape)
+                masked_input_ids = story_ids.detach().clone()
+                story_ids_mlm = story_ids.detach().clone()
+          
+                masked_input_ids[token_mask < 0.15] = 103 # [MASK] token
+                
+                story_ids_mlm[token_mask >= 0.15] = -100   # it doesn't compute these
+                story_ids_mlm[story_att_mask == 0] = -100  # it doesn't compute these
+                story_ids[story_att_mask == 0] = -100  # it doesn't compute these
+          
+                # Mask for highlights ids 
+                high_ids_mask = high_ids.detach().clone()
+                high_ids_mask[high_ids[:,:] > 0] = 1
+                
+                # Mask for nonhighlights ids
+                neg_high_ids_mask = neg_high_ids.detach().clone()
+                neg_high_ids_mask[neg_high_ids[:,:] > 0] = 1
 
-            # mask stories tokens with prob 15%, note id 103 is the [MASK] token
-            token_mask = torch.rand(story_ids.shape)
-            masked_input_ids = story_ids.detach().clone()
-            masked_input_ids[token_mask < 0.15] = 103 # [MASK] token
+                # FOR DOC + STORIES ALIGNMENT
+                doc_story = construct_bert_input(doc_embed, story_ids, extractive_bert, device=device) # [batch, 512,768]
+                # pad attention mask with a 1 on the left so model pays attention to the doc part
+                doc_story_mask  = F.pad(story_att_mask, (1, 0), value=1)
+                    
+                # FOR DOC + HIGHLIGHTS ALIGNMENT
+                doc_high = construct_bert_input(doc_embed, high_ids, extractive_bert, device=device) # [batch, 512,768]
+                doc_high_mask  = F.pad(high_ids_mask, (1, 0), value=1)
+                
+                # FOR DOC + NON-HIGHLIGHTS ALIGNMENT
+                doc_nonhigh = construct_bert_input(doc_embed, neg_high_ids, extractive_bert, device=device) # [batch, 512,768]
+                doc_nonhigh_mask = F.pad(neg_high_ids_mask, (1, 0), value=1)
+                
+                # Mask out all tokens but [CLS] from stories, highlihgts and nonhighlights to calculate alignment loss 
+                story_cls_tokens = story_ids.clone()
+                high_cls_tokens = high_ids.clone()
+                neg_high_cls_tokens = neg_high_ids.clone()
+                
+                story_cls_tokens[story_ids != 101] = 0
+                high_cls_tokens[high_ids != 101] = 0
+                neg_high_cls_tokens[neg_high_ids != 101] = 0
+                # Pad with 0 in front because they are used with the document embedding token (construct bert input)
+                story_cls_tokens = F.pad(story_cls_tokens, (1, 0), value=0)
+                high_cls_tokens = F.pad(high_cls_tokens, (1, 0), value=0)
+                neg_high_cls_tokens = F.pad(neg_high_cls_tokens, (1, 0), value=0)
+                
+                #pdb.set_trace()
+                outputs = extractive_bert(
+                    stories_mlm=masked_input_ids.to(device),
+                    labels_lm = story_ids_mlm.to(device),
+                    doc_story=doc_story.to(device),
+                    doc_high=doc_high.to(device),
+                    doc_nonhigh=doc_nonhigh.to(device),
+                    story_mask=story_att_mask.to(device),
+                    doc_story_mask=doc_story_mask.to(device),
+                    doc_high_mask=doc_high_mask.to(device),
+                    doc_nonhigh_mask=doc_nonhigh_mask.to(device),
+                    stories = story_ids.to(device),
+                    stories_cls_tokens_mask=story_cls_tokens.to(device),
+                    pos_high_cls_tokens_mask=high_cls_tokens.to(device),
+                    neg_highl_cls_tokens_mask=neg_high_cls_tokens.to(device),
+                    device=device
+                )
 
-            story_ids[token_mask >= 0.15] = -100   # it doesn't compute these
-            story_ids[story_att_mask == 0] = -100  # it doesn't compute these
+                loss = (2. / 4.) * outputs['sent_pred_loss'] \
+                   + (1. / 6.) * outputs['doc_story_loss'] \
+                   + (1. / 6.) * outputs['doc_high_loss'] \
+                   + (1. / 6.) * outputs['doc_nmhigh_loss']
+                
+                
+                #loss = adaptive_loss(outputs)
+                #print('adaptive loss: ', loss.item())
+                loss.backward()
+                opt.step()
+                scheduler.step()
+                #print_memory()
+                print('gpu processes:')
+                print(torch.cuda.list_gpu_processes(device))
+                #print('memory stats')
+                #print(torch.cuda.memory_stats(device=device))
 
-            print('\nCalling construct bert input...')
-            embeds = construct_bert_input(doc_embed, masked_input_ids, extractive_bert, device=device) # [batch, 512,768]
-            # pad attention mask with a 1 on the left so model pays attention to the doc part
-            attention_mask  = F.pad(story_att_mask, (1, 0), value=1)
+                for k, v in outputs.items():
+                    if k in avg_losses:
+                        if % 100 == 0:
+                            print(f'{k}: ', v)
+                        avg_losses[k].append(v.cpu().item())
+                avg_losses["total"].append(loss.cpu().item())
+                if i%100 ==0:
+                    print('loss: ', loss.item())
+                del outputs
+                gc.collect()
+                i+=1
+            if (ep % 5 == 0 and ep != 0) or ep == params.num_epochs - 1:
+                print('Saving!')
+                model_name = f'extractivebert_cnn_epoch_{ep}'
+                ExtractiveBert.save_pretrained(model_name)
+                save_json(f"{model_name}/train_params.json", params.__dict__)
 
-            outputs = extractive_bert(
-                embeds=embeds.to(device),
-                attention_mask=attention_mask.to(device),
-                labels = story_ids.to(device),
-                pos_highlights_ids=high_ids.to(device),
-                neg_highlights_ids=neg_high_ids.to(device),
-                device=device
-            )
+            print("***************************")
+            print(f"At epoch {ep + 1}, losses: ")
+            for k, v in avg_losses.items():
+                print(f"{k}: {sum(v) / len(v)}")
+            print("***************************")
 
-            loss = adaptive_loss(outputs)
-            print('adaptive loss: ', loss)
-            loss.backward()
-            opt.step()
-            scheduler.step()
+
+def train_iter_fct():
+    return DataloaderMultiple(args, load_dataset(args, 'train', shuffle=True), args.batch_size, device,
+                              shuffle=True, is_test=False)
+    
+def train_(train_iter_fct, train_steps):
+    step = 0
+    true_batchs = []
+    print('training steps: ', train_steps)
+    
+    train_iter = train_iter_fct()
+    while step <= train_steps:
+        
+        for i, batch in enumerate(train_iter):
+            print('batch: ', batch)
+            true_batchs.append(batch)
             
-            for k, v in outputs.items():
-                if k in avg_losses:
-                    avg_losses[k].append(v.cpu().item())
-            avg_losses["total"].append(loss.cpu().item())
-            print('loop complete')
-            
-        if (ep % 5 == 0 and ep != 0) or ep == params.num_epochs - 1:
-            print('Saving!')
-            model_name = f'extractivebert_cnn_epoch_{ep}'
-            ExtractiveBert.save_pretrained(model_name)
-            save_json(f"{model_name}/train_params.json", params.__dict__)
-
-        print("***************************")
-        print(f"At epoch {ep + 1}, losses: ")
-        for k, v in avg_losses.items():
-            print(f"{k}: {sum(v) / len(v)}")
-        print("***************************")
-
 
 class TrainParams:
     lr = 2e-5
-    batch_size = 2
+    batch_size = 12
     beta1 = 0.95
     beta2 = .999
     weight_decay = 1e-4
@@ -275,35 +445,43 @@ class TrainParams:
     num_epochs = 10
     clip = 1.0
 
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train ExtractiveBERT.')
-    #parser.add_argument('--path_to_images', help='Absolute path to image directory', default='/Users/alexschneidman/Documents/CMU/CMU/F20/777/ADARI/v2/full')
-    #parser.add_argument('--path_to_data_dict', help='Absolute path to json containing img name, sentence pair dict', default='/Users/alexschneidman/Documents/CMU/CMU/F20/777/ADARI/ADARI_furniture_pairs.json')
-    parser.add_argument('--path_to_dataset', help='Absolute path to .json file',
+def parse_arg():
+    """Creates a parser for command-line arguments.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-task", default='ext', type=str, choices=['ext', 'abs'])
+    parser.add_argument("-mode", default='train', type=str, choices=['train', 'validate', 'test'])
+    parser.add_argument("-bert_data_path", default='../data/batches_processed')
+    parser.add_argument("-batch_size", default=140, type=int)
+    parser.add_argument("-train_steps", default=1000, type=int)
+    parser.add_argument('-path_to_dataset', help='Absolute path to .json file',
                         default='../data/cnn_train.json')
+    parser.add_argument('-disable-cuda', action='store_true',
+                    help='Disable CUDA')
+    return parser.parse_args() 
+    
+    
+    
+if __name__ == '__main__':
+    
+    args = parse_arg()
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    #device = torch.device('cpu')
     print('Device: ', device)
-    args = parser.parse_args()
     params = TrainParams()
 
     print('Initiating extractive bert....')
     extractive_bert = ExtractiveBert.from_pretrained('bert-base-uncased', return_dict=True)
-    #dataset = MultiModalBertDataset(
-    #    args.path_to_images,
-    #    args.path_to_data_dict,
-    #    device=device,
-    #    )
-    #dataset = ExtractiveDataset(args.path_to_dataset, device)
 
     try:
         print('training!')
-        train(extractive_bert, args.path_to_dataset, params, device)
+#         train_(train_iter_fct, args.train_steps)
+        train(extractive_bert, args.bert_data_path, params, device)
     except KeyboardInterrupt:
         pass
     model_time = datetime.datetime.now().strftime("%X")
-    model_name = f"fashionbert_{model_time}"
+    model_name = f"extractivebert_{model_time}"
     print(f"Saving trained model to directory {model_name}...")
-    fashion_bert.save_pretrained(model_name)
+    extractive_bert.save_pretrained(model_name)
     save_json(f"{model_name}/train_params.json", params.__dict__)
