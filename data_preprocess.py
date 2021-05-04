@@ -362,21 +362,11 @@ def select_source_sents_and_partition_dataset(dataset_path, args):
                 c_story.append(sent)
 
         story = c_story
-        # print('story: ', story)
+
         clean_story, sent_labels = greedy_selection(story[:args.max_src_nsents], highlights, 4)
-        print('len clean story: ', clean_story)
-        print('sent labels: ', sent_labels)
-#         sorted_story = []
-#         _story = copy.deepcopy(story)
-#         for idx in sent_labels:
-#             sorted_story.append(story[idx])
-#             _story.remove(story[idx])
-#         sorted_story += [sent for sent in _story]
-#         sorted_story = sorted_story[:args.max_src_nsents]
-        
-        clean_story = clean_story[:args.max_src_nsents]
+
         new_sample = {'id': i,
-                      'story': sorted_story,
+                      'story': clean_story,
                       'labels': sent_labels,
                       'highlights': highlights}
 
@@ -462,7 +452,6 @@ def partition_jsons(args):
             print('Creating dir...')
             path = args.save_path + '{}_batch_{}'.format(args.mode, b)
             print(path)
-            #os.makedirs(os.path.dirname(path), exist_ok=True)
             os.mkdir(path)
             print('created!')
         name = path + '/cnn_{}_{}.json'.format(args.mode, b)
@@ -480,7 +469,8 @@ class MultiprocessData():
         
         print('Generating all highlights...')
         self.allfiles = open_json(args.main_json)
-        
+
+        # We need all highlights to generate the negative pairs from this distribution
         self.all_high = []
         for s in self.allfiles:
             high = s['highlights']  # list with sentences
@@ -519,7 +509,8 @@ class MultiprocessData():
         data = open_json(filename)
         num_stories = len(data)
         print('num stories: ', num_stories)
-        df = pd.DataFrame(columns=["id", "doc_embed", "story_ids", "att_mask_story", "high_ids", "neg_high_ids"])
+        df = pd.DataFrame(columns=["id", "doc_embed", "story_ids", "story_labels", "att_mask_story", "high_ids",
+                                                                                                      "neg_high_ids"])
        
         for i, sample in enumerate(data):
             #if i%3 == 0:
@@ -528,7 +519,7 @@ class MultiprocessData():
             id_ = sample['id']
             story = sample['story']
             highlights = sample['highlights']
-            #sent_labels = sample['labels']
+            sent_labels = sample['labels']
 
             doc_embed = generate_encoding_doc(story, self.tokenizer, self.model)
             neg_high = get_random_sents(self.all_high, num_stories, highlights)
@@ -543,10 +534,19 @@ class MultiprocessData():
             token_neg_high = []
             token_types_neg_high = []
 
+            story_labels = []
+
             for i, s in enumerate(story):
                 tokens = self.tokenizer.encode(s)
                 # tokens = self.tokenizer(s, max_length=511, truncation=True, padding = 'max_length', return_tensors = 'pt')
                 token_story += tokens
+
+                # Add story sentence label
+                if i in sent_labels:
+                    story_labels.append(1)
+                else:
+                    story_labels.append(0)
+
                 if i%2 == 0:
                     types = [0] * len(tokens)
                 else:
@@ -572,6 +572,7 @@ class MultiprocessData():
                 token_types_neg_high += types
 
             story_ids = torch.LongTensor(token_story[:511])
+            story_labels = np.array(story_labels)
             high_ids = torch.LongTensor(token_high[:512])
             neg_high_ids = torch.LongTensor(token_neg_high[:512])
             att_mask_story = torch.ones_like(story_ids)
@@ -579,12 +580,14 @@ class MultiprocessData():
             df=df.append({'id': id_,
                             'doc_embed': doc_embed.detach().cpu().numpy(),
                             'story_ids': story_ids.detach().cpu().numpy(),
+                            'story_labels': story_labels,
                             'att_mask_story': att_mask_story.detach().cpu().numpy(),
                             'high_ids': high_ids.detach().cpu().numpy(),
                             'neg_high_ids': neg_high_ids.detach().cpu().numpy(), 
                             'highlights_str': highlights,
                          },ignore_index=True)
             del story_ids
+            del story_labels
             del high_ids
             del neg_high_ids
             del att_mask_story
@@ -631,99 +634,22 @@ class MultiprocessData():
 
     
 ###############################################################        
-def preprocess_dataloader(args):
-
-    # Open dataset
-    dataset = open_json(args.load_json)
-    num_stories = len(dataset)
-
-    # Set up tokenizer and model
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    model = BertModel.from_pretrained('bert-base-uncased', return_dict=True, output_hidden_states=True)
-
-    # Get all highlights
-    all_high = []
-    for s in dataset:
-        high = s['highlights']  # list with sentences
-        all_high += high
-
-
-    df = pd.DataFrame(columns=["id", "doc_embed", "story_ids", "att_mask_story", "high_ids", "neg_high_ids"])
-    for sample in tqdm(dataset):
-        id = sample['id']
-        story = sample['story']
-        highlights = sample['highlights']
-
-        doc_embed = generate_encoding_doc(story, tokenizer, model)
-        neg_high = get_random_sents(all_high, num_stories, highlights)
-
-        # All lists we need
-        token_story = []
-        token_types_story = []
-
-        token_high = []
-        token_types_high = []
-
-        token_neg_high = []
-        token_types_neg_high = []
-
-        for i, s in enumerate(story):
-            tokens = tokenizer.encode(s)
-            # tokens = self.tokenizer(s, max_length=511, truncation=True, padding = 'max_length', return_tensors = 'pt')
-            token_story += tokens
-            if i%2 == 0:
-                types = [0] * len(tokens)
-            else:
-                types = [1] * len(tokens)
-            token_types_story += types
-
-        for i, h in enumerate(highlights):
-            tokens = tokenizer.encode(h)
-            token_high += tokens
-            if i%2 == 0:
-                types = [0] * len(tokens)
-            else:
-                types = [1] * len(tokens)
-            token_types_high += types
-
-        for i, nh in enumerate(neg_high):
-            tokens = tokenizer.encode(nh)
-            token_neg_high += tokens
-            if i%2 == 0:
-                types = [0] * len(tokens)
-            else:
-                types = [1] * len(tokens)
-            token_types_neg_high += types
-
-        story_ids = torch.LongTensor(token_story[:511])
-        high_ids = torch.LongTensor(token_high[:512])
-        neg_high_ids = torch.LongTensor(token_neg_high[:512])
-        att_mask_story = torch.ones_like(story_ids)
-
-        df=df.append({'id': id,
-                            'doc_embed': doc_embed,
-                            'story_ids': story_ids,
-                            'att_mask_story': att_mask_story,
-                            'high_ids': high_ids,
-                            'neg_high_ids': neg_high_ids},ignore_index=True)
-
-    df.to_pickle(args.save_path + f'cnn_train_{args.preprocess_mode}_4_dataloader.pkl')
-
 
 def create_parser():
     """Creates a parser for command-line arguments.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='test', choices=['train', 'val', 'test'])
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'val', 'test'])
     parser.add_argument('--raw_dataset', type=str, default='../data/cnn/stories', help='Path to dataset')
-    parser.add_argument('--save_path', type=str, default='../data/cnn_final/test/', help='Path to save '
-    																							 'preprocessed dataset')
+    parser.add_argument('--save_path', type=str, default='../data/cnn/cnn_final/train/', help='Path to save '
+                                                                                             'preprocessed '
+                                                                                     'dataset')
 
     parser.add_argument('--preprocessed_dataset', type=str,
-                        default='../data/cnn/preprocessed_ourmethod/cnn_dataset_preprocessed.pkl',
+                        default='../data/cnn/cnn_final/cnn_dataset_preprocessed.pkl',
                         help='Path to dataset')
 
-    parser.add_argument('--main_json', default='../data/cnn_final/cnn_test_wid.json', type=str)
+    parser.add_argument('--main_json', default='../data/cnn/cnn_final/cnn_train_wid.json', type=str)
     parser.add_argument('--load_json', default='../data/test', type=str)
     parser.add_argument('--load_pkl', default='../data/cnn_test_4_dataloader.pkl', type=str)
     
@@ -746,32 +672,18 @@ if __name__ == "__main__":
     
     args = create_parser()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    # load stories
-    # directory = args.raw_dataset
-    # save_directory = args.save_dataset
-
-    # print('directory: ', directory)
-    # tokenize(args)
-    # format_to_lines(args)
-
-    # stories = load_stories(directory)
-    # print('Loaded Stories %d' % len(stories))
 
     st = time.time()
     #path = '/Users/manuelladron/iCloud_archive/Documents/_CMU/PHD-CD/spring2021/11747_neural_networks_for_NLP
     # /project/data/cnn/preprocessed_lines/.test.0.json'
     # check_tokenize_file(path)
     #clean_and_save_dataset(args.preprocessed_dataset, args.save_dataset_c)
-    #select_source_sents_and_partition_dataset(args.preprocessed_dataset, args)
-#     preprocess_dataloader(args)
-#     partition_jsons(args)
-    M = MultiprocessData(args)
+    # select_source_sents_and_partition_dataset(args.preprocessed_dataset, args)
+    partition_jsons(args)
+#     M = MultiprocessData(args)
 #     df = M.pd_wrapper(directory=args.load_json, pattern='*.json')
 #     df.to_pickle(args.save_dataset + f'cnn_{args.preprocess_mode}_4_dataloader.pkl')
     #check_pkl_file(args.load_pkl)
 
     print('time: ', time.time()-st)
 
-    #save to file
-    # print('Saving in: ', save_directory)
-    # dump(stories, open(save_directory + '/cnn_dataset_preprocessed_2.pkl', 'wb'))
