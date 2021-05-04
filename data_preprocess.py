@@ -375,6 +375,7 @@ def select_source_sents_and_partition_dataset(dataset_path, args):
         new_sample = {'id': i,
                       'story': sorted_story,
                       'highlights': highlights}
+
         story_s.append(new_sample)
         i+=1
 
@@ -443,7 +444,7 @@ def get_random_sents(all_highlights, num_h, highlight):
 
 ########## functions for multiprocessing ####################
 def partition_jsons(args):
-    dataset = open_json(args.all_jsons)
+    dataset = open_json(args.main_json)
     num_stories = len(dataset)
     print('num stories: ', num_stories)
     batch_size = 50
@@ -452,13 +453,13 @@ def partition_jsons(args):
     
     for b in range(num_batches):
         if b%50==0:
-            path = args.save_path + f'batch_{b}'
+            path = args.save_path + f'{args.mode}_batch_{b}'
             try: 
                 os.mkdir(path) 
             except OSError as error: 
                 print(error) 
           
-        name = path + f'/cnn_train_{b}.json'
+        name = path + f'/cnn_{args.mode}_{b}.json'
         #print('first idx: ', num_batches*b, 'second index: ', num_batches*(b+1))  
         save_json(name, dataset[batch_size*b : batch_size*(b+1)])
     print('Done!')
@@ -466,6 +467,7 @@ def partition_jsons(args):
 class MultiprocessData():
     def __init__(self, args):
         self.args = args
+
         print('Loading tokenizer and model...')
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
         self.model = BertModel.from_pretrained('bert-base-uncased', return_dict=True, output_hidden_states=True)
@@ -705,7 +707,7 @@ def create_parser():
     """Creates a parser for command-line arguments.
     """
     parser = argparse.ArgumentParser()
-
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'val', 'test'])
     parser.add_argument('--raw_dataset', type=str, default='../data/cnn/stories', help='Path to dataset')
     parser.add_argument('--save_dataset', type=str, default='../data/cnn_final/', help='Path to save '
     																							 'preprocessed dataset')
@@ -714,10 +716,10 @@ def create_parser():
                         default='../data/cnn/preprocessed_ourmethod/cnn_dataset_preprocessed.pkl',
                         help='Path to dataset')
 
-    parser.add_argument('--save_path', type=str, default='../data/cnn_final/all_jsons/',
+    parser.add_argument('--save_path', type=str, default='../data/cnn_final/test/',
                         help='Path to save preprocessed dataset')
     
-    parser.add_argument('--all_jsons', default='../data/cnn_final/cnn_train_wid.json', type=str)
+    parser.add_argument('--main_json', default='../data/cnn_final/cnn_test_wid.json', type=str)
     parser.add_argument('--load_json', default='../data/test', type=str)
     parser.add_argument('--load_pkl', default='../data/cnn_train_4_dataloader.pkl', type=str)
     
@@ -760,8 +762,8 @@ if __name__ == "__main__":
     #clean_and_save_dataset(args.preprocessed_dataset, args.save_dataset_c)
     #select_source_sents_and_partition_dataset(args.preprocessed_dataset, args)
 #     preprocess_dataloader(args)
-#     partition_jsons(args)
-    M = MultiprocessData(args)
+    partition_jsons(args)
+    # M = MultiprocessData(args)
 #     df = M.pd_wrapper(directory=args.load_json, pattern='*.json')
 #     df.to_pickle(args.save_dataset + f'cnn_{args.preprocess_mode}_4_dataloader.pkl')
     #check_pkl_file(args.load_pkl)
