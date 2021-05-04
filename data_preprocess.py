@@ -363,17 +363,21 @@ def select_source_sents_and_partition_dataset(dataset_path, args):
 
         story = c_story
         # print('story: ', story)
-        story, sent_labels = greedy_selection(story[:args.max_src_nsents], highlights, 4)
-        sorted_story = []
-        _story = copy.deepcopy(story)
-        for idx in sent_labels:
-            sorted_story.append(story[idx])
-            _story.remove(story[idx])
-        sorted_story += [sent for sent in _story]
-        sorted_story = sorted_story[:args.max_src_nsents]
-
+        clean_story, sent_labels = greedy_selection(story[:args.max_src_nsents], highlights, 4)
+        print('len clean story: ', clean_story)
+        print('sent labels: ', sent_labels)
+#         sorted_story = []
+#         _story = copy.deepcopy(story)
+#         for idx in sent_labels:
+#             sorted_story.append(story[idx])
+#             _story.remove(story[idx])
+#         sorted_story += [sent for sent in _story]
+#         sorted_story = sorted_story[:args.max_src_nsents]
+        
+        clean_story = clean_story[:args.max_src_nsents]
         new_sample = {'id': i,
                       'story': sorted_story,
+                      'labels': sent_labels,
                       'highlights': highlights}
 
         story_s.append(new_sample)
@@ -450,16 +454,18 @@ def partition_jsons(args):
     batch_size = 50
     num_batches = num_stories // batch_size
     print('num batches: ', num_batches)
-    
+    print('Creating dir...')
+    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+    print('created!')
     for b in range(num_batches):
         if b%50==0:
-            path = args.save_path + f'{args.mode}_batch_{b}'
-            try: 
-                os.mkdir(path) 
-            except OSError as error: 
-                print(error) 
-          
-        name = path + f'/cnn_{args.mode}_{b}.json'
+            print('Creating dir...')
+            path = args.save_path + '{}_batch_{}'.format(args.mode, b)
+            print(path)
+            #os.makedirs(os.path.dirname(path), exist_ok=True)
+            os.mkdir(path)
+            print('created!')
+        name = path + '/cnn_{}_{}.json'.format(args.mode, b)
         #print('first idx: ', num_batches*b, 'second index: ', num_batches*(b+1))  
         save_json(name, dataset[batch_size*b : batch_size*(b+1)])
     print('Done!')
@@ -473,7 +479,7 @@ class MultiprocessData():
         self.model = BertModel.from_pretrained('bert-base-uncased', return_dict=True, output_hidden_states=True)
         
         print('Generating all highlights...')
-        self.allfiles = open_json(args.all_jsons)
+        self.allfiles = open_json(args.main_json)
         
         self.all_high = []
         for s in self.allfiles:
@@ -491,7 +497,7 @@ class MultiprocessData():
             print('------folder: ', folder_name)
             self.print_memory()
             df = self.pd_wrapper(directory=folder_name , pattern='*.json', processes=-1)
-            df.to_pickle(args.save_dataset + f'cnn_{args.preprocess_mode}_4_dataloader_{folder}.pkl')
+            df.to_pickle(args.save_path + f'cnn_{args.mode}_4_dataloader_{folder}.pkl')
             print('\nSaved df file succesfully')
             f+=1
             del df
@@ -522,6 +528,7 @@ class MultiprocessData():
             id_ = sample['id']
             story = sample['story']
             highlights = sample['highlights']
+            #sent_labels = sample['labels']
 
             doc_embed = generate_encoding_doc(story, self.tokenizer, self.model)
             neg_high = get_random_sents(self.all_high, num_stories, highlights)
@@ -574,7 +581,8 @@ class MultiprocessData():
                             'story_ids': story_ids.detach().cpu().numpy(),
                             'att_mask_story': att_mask_story.detach().cpu().numpy(),
                             'high_ids': high_ids.detach().cpu().numpy(),
-                            'neg_high_ids': neg_high_ids.detach().cpu().numpy()
+                            'neg_high_ids': neg_high_ids.detach().cpu().numpy(), 
+                            'highlights_str': highlights,
                          },ignore_index=True)
             del story_ids
             del high_ids
@@ -583,7 +591,6 @@ class MultiprocessData():
             del doc_embed
             del neg_high
             gc.collect()
-            
             
         print('\nReturning dataframe')
         return df
@@ -707,24 +714,19 @@ def create_parser():
     """Creates a parser for command-line arguments.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'val', 'test'])
+    parser.add_argument('--mode', type=str, default='test', choices=['train', 'val', 'test'])
     parser.add_argument('--raw_dataset', type=str, default='../data/cnn/stories', help='Path to dataset')
-    parser.add_argument('--save_dataset', type=str, default='../data/cnn_final/', help='Path to save '
+    parser.add_argument('--save_path', type=str, default='../data/cnn_final/test/', help='Path to save '
     																							 'preprocessed dataset')
 
     parser.add_argument('--preprocessed_dataset', type=str,
                         default='../data/cnn/preprocessed_ourmethod/cnn_dataset_preprocessed.pkl',
                         help='Path to dataset')
 
-    parser.add_argument('--save_path', type=str, default='../data/cnn_final/test/',
-                        help='Path to save preprocessed dataset')
-    
     parser.add_argument('--main_json', default='../data/cnn_final/cnn_test_wid.json', type=str)
     parser.add_argument('--load_json', default='../data/test', type=str)
-    parser.add_argument('--load_pkl', default='../data/cnn_train_4_dataloader.pkl', type=str)
+    parser.add_argument('--load_pkl', default='../data/cnn_test_4_dataloader.pkl', type=str)
     
-    
-    parser.add_argument('--preprocess_mode', default='train', type=str)
     parser.add_argument("--shard_size", default=2000, type=int)
     parser.add_argument('--min_src_nsents', default=3, type=int)
     parser.add_argument('--max_src_nsents', default=100, type=int)
@@ -762,8 +764,8 @@ if __name__ == "__main__":
     #clean_and_save_dataset(args.preprocessed_dataset, args.save_dataset_c)
     #select_source_sents_and_partition_dataset(args.preprocessed_dataset, args)
 #     preprocess_dataloader(args)
-    partition_jsons(args)
-    # M = MultiprocessData(args)
+#     partition_jsons(args)
+    M = MultiprocessData(args)
 #     df = M.pd_wrapper(directory=args.load_json, pattern='*.json')
 #     df.to_pickle(args.save_dataset + f'cnn_{args.preprocess_mode}_4_dataloader.pkl')
     #check_pkl_file(args.load_pkl)
