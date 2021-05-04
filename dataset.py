@@ -274,6 +274,7 @@ class LazyDataset(Dataset):
             torch.tensor(sample.id),
             torch.tensor(sample.doc_embed),
             torch.tensor(sample.story_ids),
+            torch.tensor(sample.story_labels),
             torch.tensor(sample.att_mask_story),
             torch.tensor(sample.high_ids),
             torch.tensor(sample.neg_high_ids)
@@ -295,16 +296,18 @@ def new_collate(batch):
 #     print('doc embeds shape: ', doc_embeds.shape)
 
     story_ids = pad_sequence([item[2] for item in batch], batch_first=True)
-    story_att_mask = pad_sequence([item[3] for item in batch], batch_first=True)
-    high_ids = pad_sequence([item[4] for item in batch], batch_first=True)
-    neg_high_ids = pad_sequence([item[5] for item in batch], batch_first=True)
+    story_labels = pad_sequence([item[3] for item in batch], batch_first=True)
+    story_att_mask = pad_sequence([item[4] for item in batch], batch_first=True)
+    high_ids = pad_sequence([item[5] for item in batch], batch_first=True)
+    neg_high_ids = pad_sequence([item[6] for item in batch], batch_first=True)
 
-#     print('story ids shape: ', story_ids.shape)
-#     print('story att mask shape: ', story_att_mask.shape)
-#     print('high_ids shape: ', high_ids.shape)
-#     print('neg high ids: ', neg_high_ids.shape)
+    print('story ids shape: ', story_ids.shape)
+    print('story ids shape: ', story_labels.shape)
+    print('story att mask shape: ', story_att_mask.shape)
+    print('high_ids shape: ', high_ids.shape)
+    print('neg high ids: ', neg_high_ids.shape)
 
-    return ids, doc_embeds, story_ids, story_att_mask, high_ids, neg_high_ids
+    return ids, doc_embeds, story_ids, story_labels, story_att_mask, high_ids, neg_high_ids
     
    
 

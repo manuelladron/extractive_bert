@@ -482,17 +482,18 @@ class MultiprocessData():
         print('MAIN DIR: ', root_dir)
         f = 0
         for folder in os.listdir(root_dir):
-            st_ = time.time()
-            folder_name = os.path.join(root_dir, folder)
-            print('------folder: ', folder_name)
-            self.print_memory()
-            df = self.pd_wrapper(directory=folder_name , pattern='*.json', processes=-1)
-            df.to_pickle(args.save_path + f'cnn_{args.mode}_4_dataloader_{folder}.pkl')
-            print('\nSaved df file succesfully')
-            f+=1
-            del df
-            gc.collect()
-            print(f'Time to process folder {f}: {time.time() - st_} s')
+            if os.path.isdir(folder) and not folder.startswith("."):
+                st_ = time.time()
+                folder_name = os.path.join(root_dir, folder)
+                print('------folder: ', folder_name)
+                self.print_memory()
+                df = self.pd_wrapper(directory=folder_name , pattern='*.json', processes=-1)
+                df.to_pickle(args.save_path + f'cnn_{args.mode}_4_dataloader_{folder}.pkl')
+                print('\nSaved df file succesfully')
+                f+=1
+                del df
+                gc.collect()
+                print(f'Time to process folder {f}: {time.time() - st_} s')
             
     def get_files(self, directory, pattern):
         for path in Path(directory).rglob(pattern):
@@ -602,10 +603,12 @@ class MultiprocessData():
         # Decide how many proccesses will be created
         sum_size = 0
         if processes <=0:
-            num_cpus = psutil.cpu_count(logical=False)
+            #num_cpus = psutil.cpu_count(logical=False)
+            num_cpus = os.cpu_count()
         else:
             num_cpus = processes
         print('num cpus: ', num_cpus)
+        print('num cpus os: ', os.cpu_count())
         
         files = []
         # Get files based on pattern and their sum of size
