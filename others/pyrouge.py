@@ -15,7 +15,7 @@ except ImportError:
     from ConfigParser import ConfigParser
 
 # from pyrouge.utils import log
-# from pyrouge.utils.file_utils import verify_dir
+from pyrouge.utils.file_utils import verify_dir
 
 
 REMAP = {"-lrb-": "(", "-rrb-": ")", "-lcb-": "{", "-rcb-": "}",
@@ -39,8 +39,9 @@ class DirectoryProcessor:
         """
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-        logger = log.get_global_console_logger()
-        logger.info("Processing files in {}.".format(input_dir))
+        #logger = log.get_global_console_logger()
+        print('processing files in {}'.format(input_dir))
+        #logger.info("Processing files in {}.".format(input_dir))
         input_file_names = os.listdir(input_dir)
         for input_file_name in input_file_names:
             input_file = os.path.join(input_dir, input_file_name)
@@ -50,8 +51,8 @@ class DirectoryProcessor:
             output_file = os.path.join(output_dir, input_file_name)
             with codecs.open(output_file, "w", encoding="UTF-8") as f:
                 f.write(clean(output_string.lower()))
-        logger.info("Saved processed files to {}.".format(output_dir))
-
+        #logger.info("Saved processed files to {}.".format(output_dir))
+        print("Saved processed files to {}.".format(output_dir))
 
 class Rouge155(object):
     """
@@ -116,7 +117,7 @@ class Rouge155(object):
 
         """
         self.temp_dir=temp_dir
-        self.log = log.get_global_console_logger()
+        #self.log = log.get_global_console_logger()
         self.__set_dir_properties()
         self._config_file = None
         self._settings_file = self.__get_config_path()
@@ -132,7 +133,8 @@ class Rouge155(object):
         config.set(section, 'home_dir', self._home_dir)
         with open(self._settings_file, 'w') as f:
             config.write(f)
-        self.log.info("Set ROUGE home directory to {}.".format(self._home_dir))
+        #self.log.info("Set ROUGE home directory to {}.".format(self._home_dir))
+        print("Set ROUGE home directory to {}.".format(self._home_dir))
 
     @property
     def settings_file(self):
@@ -350,8 +352,9 @@ class Rouge155(object):
             self._system_dir, self._system_filename_pattern,
             self._model_dir, self._model_filename_pattern,
             self._config_file, system_id)
-        self.log.info(
-            "Written ROUGE configuration to {}".format(self._config_file))
+        # self.log.info(
+        #     "Written ROUGE configuration to {}".format(self._config_file))
+        print("Written ROUGE configuration to {}".format(self._config_file))
 
     def evaluate(self, system_id=1, rouge_args=None):
         """
@@ -368,8 +371,9 @@ class Rouge155(object):
         self.write_config(system_id=system_id)
         options = self.__get_options(rouge_args)
         command = [self._bin_path] + options
-        self.log.info(
-            "Running ROUGE with command {}".format(" ".join(command)))
+        print("Running ROUGE with command {}".format(" ".join(command)))
+        # self.log.info(
+        #     "Running ROUGE with command {}".format(" ".join(command)))
         rouge_output = check_output(command).decode("UTF-8")
         return rouge_output
 
@@ -513,16 +517,19 @@ class Rouge155(object):
         os.mkdir(new_system_dir)
         new_model_dir = os.path.join(temp_dir, "model")
         os.mkdir(new_model_dir)
-        self.log.info(
-            "Processing summaries. Saving system files to {} and "
+        print("Processing summaries. Saving system files to {} and "
             "model files to {}.".format(new_system_dir, new_model_dir))
+        # self.log.info(
+        #     "Processing summaries. Saving system files to {} and "
+        #     "model files to {}.".format(new_system_dir, new_model_dir))
         process_func(self._system_dir, new_system_dir)
         process_func(self._model_dir, new_model_dir)
         self._system_dir = new_system_dir
         self._model_dir = new_model_dir
 
     def __write_summaries(self):
-        self.log.info("Writing summaries.")
+        #self.log.info("Writing summaries.")
+        print('Writing summaries')
         self.__process_summaries(self.convert_summaries_to_rouge_format)
 
     @staticmethod

@@ -16,7 +16,9 @@ import time
 from utils import open_json
 import glob
 import gc 
-import bisect 
+import bisect
+
+
 
 def generate_encoding_doc(story, tokenizer, model):
     """
@@ -246,22 +248,7 @@ def collate(batch):
 
 ########################### Lazy Dataset ########################################################
 
-def pickle2torch(pickle_path):
-    
-    pkl = pickle_loader(pickle_path + 'cnn_train_4_dataloader_batch_50.pkl')
-    
-    print('length of pkl: ', len(pkl))
-    print(pkl.iloc[0])
-    for i in range(len(pkl)):
-        sample = self.dataset.iloc[idx]
 
-#     return (
-#         torch.tensor(sample.patches).view(sample.patches.shape[0], sample.patches.shape[1]), 
-#         torch.tensor(sample.input_ids),
-#         torch.tensor(sample.is_paired),
-#         torch.tensor(sample.attention_mask)
-#         )
-    
 class LazyDataset(Dataset):
     def __init__(self, filename):
         self._filename = filename
@@ -277,7 +264,9 @@ class LazyDataset(Dataset):
             torch.tensor(sample.story_labels),
             torch.tensor(sample.att_mask_story),
             torch.tensor(sample.high_ids),
-            torch.tensor(sample.neg_high_ids)
+            torch.tensor(sample.neg_high_ids),
+            sample.highlights_str,
+            sample.story_str,
             )
 
     def __len__(self):
@@ -295,19 +284,16 @@ def new_collate(batch):
 #     print('ids shape: ' , ids.shape)
 #     print('doc embeds shape: ', doc_embeds.shape)
 
-    story_ids = pad_sequence([item[2] for item in batch], batch_first=True)
-    story_labels = pad_sequence([item[3] for item in batch], batch_first=True)
-    story_att_mask = pad_sequence([item[4] for item in batch], batch_first=True)
-    high_ids = pad_sequence([item[5] for item in batch], batch_first=True)
-    neg_high_ids = pad_sequence([item[6] for item in batch], batch_first=True)
+    story_ids = pad_sequence([item[2] for item in batch], batch_first=True)      # [batch, 511]
+    story_labels = pad_sequence([item[3] for item in batch], batch_first=True)   # [batch, num_sents]
+    story_att_mask = pad_sequence([item[4] for item in batch], batch_first=True) # [batch, 511]
+    high_ids = pad_sequence([item[5] for item in batch], batch_first=True)       # [batch, seq_len]
+    neg_high_ids = pad_sequence([item[6] for item in batch], batch_first=True)   # [batch, seq_len]
+    highlights_str = [item[7] for item in batch] # batch list of lists
+    story_str = [item[8] for item in batch]      # batch list of lists
 
-    print('story ids shape: ', story_ids.shape)
-    print('story ids shape: ', story_labels.shape)
-    print('story att mask shape: ', story_att_mask.shape)
-    print('high_ids shape: ', high_ids.shape)
-    print('neg high ids: ', neg_high_ids.shape)
 
-    return ids, doc_embeds, story_ids, story_labels, story_att_mask, high_ids, neg_high_ids
+    return ids, doc_embeds, story_ids, story_labels, story_att_mask, high_ids, neg_high_ids, highlights_str, story_str
     
    
 
@@ -571,18 +557,18 @@ class Batch(object):
         return self.batch_size
 
     
-if __name__ == '__main__':
-    root = '../data/batches_processed/'
-    files = sorted(glob.glob(root + 'cnn_train_4_dataloader_batch_' + '[0-9]*.pkl'))
-    print('files: ', files)
-    datasets = list(map(lambda x : LazyDataset(x), files))
-    dataset = torch.utils.data.ConcatDataset(datasets)
-    print('dataset: ', dataset)
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=3,
-        shuffle=True,
-        collate_fn=new_collate,
-    )
-    it = iter(dataloader)
-    first = next(it)
+# if __name__ == '__main__':
+#     root = '../data/batches_processed/'
+#     files = sorted(glob.glob(root + 'cnn_train_4_dataloader_batch_' + '[0-9]*.pkl'))
+#     print('files: ', files)
+#     datasets = list(map(lambda x : LazyDataset(x), files))
+#     dataset = torch.utils.data.ConcatDataset(datasets)
+#     print('dataset: ', dataset)
+#     dataloader = torch.utils.data.DataLoader(
+#         dataset,
+#         batch_size=3,
+#         shuffle=True,
+#         collate_fn=new_collate,
+#     )
+#     it = iter(dataloader)
+#     first = next(it)

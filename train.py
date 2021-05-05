@@ -25,6 +25,7 @@ from utils import construct_bert_input, save_json, print_memory
 import torch, torchvision
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import numpy as np
 
 # import torch.autograd.profiler as profiler
 
@@ -79,18 +80,31 @@ def adaptive_loss(outputs):
 class AlignmentHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.alig = torch.nn.Linear(config.hidden_size, 2)
+        self.alig = torch.nn.Linear(config.hidden_size, 1)
 
     def forward(self, doc_token):
         alig_score = self.alig(doc_token)
         return alig_score
 
+class SentClassification(torch.nn.Module):
+    """
+    Use to calculate 1 objective:
+        - Sequence prediction: whether the [CLS] tokens of each sent should be included as summary
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.seq_relationship = torch.nn.Linear(config.hidden_size, 1)
+
+    def forward(self, sentence_output):
+        sent_pred_score = self.seq_relationship(sentence_output)
+        return sent_pred_score
+
 
 class AlignmentPredictionHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.seq_relationship = torch.nn.Linear(config.hidden_size, 2)
-        self.alig = torch.nn.Linear(config.hidden_size, 2)
+        self.seq_relationship = torch.nn.Linear(config.hidden_size, 1)
+        self.alig = torch.nn.Linear(config.hidden_size, 1)
 
     def forward(self, sentence_output, doc_output):
         sent_pred_score = self.seq_relationship(sentence_output)
@@ -108,10 +122,12 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
         self.im_to_embedding = torch.nn.Linear(2048, 768)
         self.im_to_embedding_norm = torch.nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-        self.mlm = BertOnlyMLMHead(config)
+        #self.mlm = BertOnlyMLMHead(config)
+        self.sent_classifier = SentClassification(config)
         self.alig_pred = AlignmentPredictionHead(config)
         self.alignment = AlignmentHead(config)
 
+        self.triplet_criterion = torch.nn.TripletMarginLoss(margin=0.5)
         self.init_weights()
 
     def compute_mlm_loss(self, prediction_scores, labels):
@@ -167,36 +183,13 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
             doc_high_mask,
             doc_nonhigh_mask,
             stories,  # [batch, 511]
+            story_labels,
             stories_cls_tokens_mask,  # [batch, seq_len]
             pos_high_cls_tokens_mask,  # [batch, seq_len]
-            neg_highl_cls_tokens_mask,  # [batch, seq_len]
+            neg_high_cls_tokens_mask,  # [batch, seq_len]
             device=None
 
     ):
-        """
-            Args:
-                doc_story
-                    hidden embeddings to pass to the bert model
-                        batch size, seq length, hidden dim
-                attention_mask
-                    batch size, seq length
-                labels: unmasked inputs ids
-                    batch size, seq length,
-                pos_highlights_ids
-                    Unmasked tokenized token ids corresponding to matching highlights
-                        batch size, word sequence length
-                neg_highlights_ids
-                    Unmasked tokenized token ids corresponding to random non-matching highlights
-                        batch size, word sequence length
-        """
-        #         print('stories_mlm: ', stories_mlm.shape)
-        #         print('doc_story: ', doc_story.shape)
-        #         print('doc_high: ', doc_high.shape)
-        #         print('doc_nonhigh: ', doc_nonhigh.shape)
-        #         print('story_mask: ', story_mask.shape)
-        #         print('story: ', stories.shape)
-        #         print('labels: ', labels_lm.shape)
-
         batch_size = doc_story.shape[0]
         seq_length = doc_story.shape[1]
         hidden_dim = doc_story.shape[2]
@@ -209,65 +202,102 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
         #         mlm_scores = self.mlm(sequence_output) # mlm scores [batch, 511, 30522]
         #         mlm_loss = self.compute_mlm_loss(mlm_scores, labels_lm)
 
-        """2nd PASS FOR DOC - STORY RELATIONSHIP"""
+        """1st PASS FOR DOC - STORY RELATIONSHIP"""
         # with profiler.profile(with_stack=True, profile_memory=True) as prof:
         outputs = self.bert(inputs_embeds=doc_story,
                             attention_mask=doc_story_mask,
                             return_dict=True)
 
         sequence_output = outputs.last_hidden_state  # [batch, 512, 768]
-        doc_output = sequence_output[:, 0, :]
+        doc_output = sequence_output[:, 0, :] # [batch, 768]
+        #story_output = sequence_output[:, 1:, :]
 
         # Mask all tokens that are not [CLS] to calculate alignment loss
         sequence_output_ = torch.clone(sequence_output).detach()
-        sequence_output_[stories_cls_tokens_mask == 0] = -100
-        indices = torch.nonzero(sequence_output_[:, :, 0] > -100)  # [variable_num, batch_size]
-        seq_len = sequence_output.shape[1]
-        labels = torch.zeros((batch_size, seq_len), dtype=torch.long).to(device)
+        sequence_output_[stories_cls_tokens_mask == -100] = -100
 
-        for i in range(batch_size):
-            # first get the indices corresponding to each batch
-            indices_b = indices[indices[:, 0] == i]
-            # Now set labels of the first 4 sentences in each batch to 1.
-            labels[i, :][indices_b[:4, 1]] = 1
+        # Calculate sentence classification
+        sent_scores  = self.sent_classifier(sequence_output_)  # [batch, 512,
+        # 1] and [batch, 1]
+        sent_class_loss = 0
+        for b in range(batch_size):
+            sent_scores_b = sent_scores[b, :, :]  # [512, 1]
+            stories_cls_b = stories_cls_tokens_mask[b, :]  # [512]
+            story_labels_b = story_labels[b, :]  # [num_sents]
+            # Now get only CLS tokens
+            only_cls_scores = sent_scores_b[stories_cls_b != -100]
+            # Now do BCE loss
+            labels = story_labels_b[:only_cls_scores.shape[0]].float()
+            loss_b = F.binary_cross_entropy_with_logits(only_cls_scores.squeeze(), labels)
+            sent_class_loss += loss_b
 
-        sent_pred, doc_alig_pred = self.alig_pred(sequence_output, doc_output)  # [2, 512, 2] and [2, 512]
-        sent_loss, doc_story_alig_loss = self.compute_doc_sent_loss(doc_alig_pred, sent_pred, labels,
-                                                                    stories_cls_tokens_mask, batch_size, device)
+        sent_class_loss /=  batch_size
 
-        """3rd PASS FOR DOC - MATCHING HIGHLIGHTS RELATIONSHIP"""
+        # Calculate alignment
+        alig_scores = self.alignment(doc_output) # [batch, 1]
+        doc_story_alig_labels = torch.ones_like(alig_scores).float().to(device)
+        doc_story_alig_loss = F.binary_cross_entropy_with_logits(alig_scores, doc_story_alig_labels)
+
+
+        """2nd PASS FOR DOC - MATCHING HIGHLIGHTS RELATIONSHIP"""
         outputs = self.bert(inputs_embeds=doc_high, attention_mask=doc_high_mask, return_dict=True)
+        sequence_output_high = outputs.last_hidden_state  # [batch, 512, 768]
         doc_output = sequence_output[:, 0, :]
 
-        doc_high_alig_score = self.alignment(doc_output)
-        doc_high_alig_loss = self.compute_doc_alig_loss(doc_high_alig_score, batch_size, device, match=True)
+        doc_high_alig_scores = self.alignment(doc_output)
+        doc_high_alig_labels = torch.ones_like(doc_high_alig_scores).float().to(device)
+        doc_high_alig_loss = F.binary_cross_entropy_with_logits(doc_high_alig_scores, doc_high_alig_labels)
 
         """4th PASS FOR DOC - NON-MATCHING HIGHLIGHTS RELATIONSHIP"""
         outputs = self.bert(inputs_embeds=doc_nonhigh, attention_mask=doc_nonhigh_mask, return_dict=True)
+        sequence_output_nonhigh = outputs.last_hidden_state  # [batch, 512, 768]
         doc_output = sequence_output[:, 0, :]
 
         # Predict the alignment score (whether embedding of doc + highlights match )
-        doc_nonhigh_alig_score = self.alignment(doc_output)
-        doc_nonhigh_alig_loss = self.compute_doc_alig_loss(doc_nonhigh_alig_score, batch_size, device, match=False)
-        # print('doc nmhigh alig loss: ', doc_nmhigh_alig_loss)
+        doc_nonhigh_alig_scores = self.alignment(doc_output)
+        doc_nonhigh_alig_labels = torch.zeros_like(doc_nonhigh_alig_scores).float().to(device)
+        doc_nonhigh_alig_loss = F.binary_cross_entropy_with_logits(doc_nonhigh_alig_scores, doc_nonhigh_alig_labels)
+
+        ######## Calculate triplet loss
+        # Anchor is story, Positive is high, Negative is non-high
+        anchor = sequence_output[stories_cls_tokens_mask == 101]
+        pos = sequence_output_high[pos_high_cls_tokens_mask == 101]
+        neg = sequence_output_nonhigh[neg_high_cls_tokens_mask == 101]
+
+        a_len = anchor.shape[0]
+        p_len = pos.shape[0]
+        n_len = neg.shape[0]
+
+        lens = np.array([a_len, p_len, n_len])
+        min_ = np.argmin(lens)
+
+        anchor = anchor[:min_, :]
+        pos = pos[:min_, :]
+        neg = neg[:min_, :]
+
+        triplet_loss = self.triplet_criterion(anchor, pos, neg)
 
         return {
             # "raw_outputs": outputs,
             # "masked_lm_loss": mlm_loss,
-            "sent_pred_loss": sent_loss,
+            "sent_class_loss": sent_class_loss,
             "doc_story_loss": doc_story_alig_loss,
             "doc_high_loss": doc_high_alig_loss,
-            "doc_nmhigh_loss": doc_nonhigh_alig_loss
+            "doc_nonhigh_loss": doc_nonhigh_alig_loss,
+            "triplet_loss": triplet_loss
         }
 
 
 def train(extractive_bert, train_set, params, device):
     torch.manual_seed(0)
-    root = '../data/batches_processed/'
-    print('---Loading files...')
-    files = sorted(glob.glob(root + 'cnn_train_4_dataloader_batch_' + '[0-9]*.pkl'))
-    datasets = list(map(lambda x: LazyDataset(x), files))
-    dataset = torch.utils.data.ConcatDataset(datasets)
+    # root = '../data/batches_processed/'
+    # print('---Loading files...')
+    # files = sorted(glob.glob(root + 'cnn_train_4_dataloader_batch_' + '[0-9]*.pkl'))
+    # datasets = list(map(lambda x: LazyDataset(x), files))
+    # dataset = torch.utils.data.ConcatDataset(datasets)
+    file = '/Users/manuelladron/iCloud_archive/Documents/_CMU/PHD-CD/spring2021/11747_neural_networks_for_NLP/project/data/cnn/cnn_final/test/cnn_test_4_dataloader_test_batch_0.pkl'
+    dataset = LazyDataset(file)
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=params.batch_size,
@@ -275,8 +305,8 @@ def train(extractive_bert, train_set, params, device):
         collate_fn=new_collate,
     )
     del dataset
-    del datasets
-    del files
+    #del datasets
+    del file
     gc.collect()
 
     print('loaded, len dataloader: ', len(dataloader))
@@ -310,10 +340,12 @@ def train(extractive_bert, train_set, params, device):
     for ep in range(params.num_epochs):
         print('epoch: ', ep)
 
-        avg_losses = {"masked_lm_loss": [], "sent_pred_loss": [], "doc_story_loss": [], "doc_high_loss": [],
-                      "doc_nmhigh_loss": [], "total": []}
+        avg_losses = {"sent_class_loss": [], "doc_story_loss": [], "doc_high_loss": [],
+                      "doc_nonhigh_loss": [], "triplet_loss": [], "total": []}
+
         i = 0
-        for ids, doc_embed, story_ids, story_att_mask, high_ids, neg_high_ids in tqdm(dataloader):
+        for ids, doc_embed, story_ids, story_labels, story_att_mask, high_ids, neg_high_ids, high_str, \
+            story_str in dataloader:
             opt.zero_grad()
 
             #             print('\n-----Shapes---------')
@@ -362,9 +394,10 @@ def train(extractive_bert, train_set, params, device):
             high_cls_tokens = high_ids.clone()
             neg_high_cls_tokens = neg_high_ids.clone()
 
-            story_cls_tokens[story_ids != 101] = 0
-            high_cls_tokens[high_ids != 101] = 0
-            neg_high_cls_tokens[neg_high_ids != 101] = 0
+            story_cls_tokens[story_ids != 101] = -100
+            high_cls_tokens[high_ids != 101] = -100
+            neg_high_cls_tokens[neg_high_ids != 101] = -100
+
             # Pad with 0 in front because they are used with the document embedding token (construct bert input)
             story_cls_tokens = F.pad(story_cls_tokens, (1, 0), value=0)
             high_cls_tokens = F.pad(high_cls_tokens, (1, 0), value=0)
@@ -382,16 +415,18 @@ def train(extractive_bert, train_set, params, device):
                 doc_high_mask=doc_high_mask.to(device),
                 doc_nonhigh_mask=doc_nonhigh_mask.to(device),
                 stories=story_ids.to(device),
+                story_labels=story_labels.to(device),
                 stories_cls_tokens_mask=story_cls_tokens.to(device),
                 pos_high_cls_tokens_mask=high_cls_tokens.to(device),
-                neg_highl_cls_tokens_mask=neg_high_cls_tokens.to(device),
+                neg_high_cls_tokens_mask=neg_high_cls_tokens.to(device),
                 device=device
             )
 
-            loss = (2. / 4.) * outputs['sent_pred_loss'] \
-                   + (1. / 6.) * outputs['doc_story_loss'] \
-                   + (1. / 6.) * outputs['doc_high_loss'] \
-                   + (1. / 6.) * outputs['doc_nmhigh_loss']
+            loss = 1 * outputs['sent_class_loss'] \
+                   + 0.3 * outputs['doc_story_loss'] \
+                   + 0.3 * outputs['doc_high_loss'] \
+                   + 0.3 * outputs['doc_nonhigh_loss'] \
+                   + 1 * outputs["triplet_loss"]
 
             # loss = adaptive_loss(outputs)
             # print('adaptive loss: ', loss.item())
@@ -404,10 +439,11 @@ def train(extractive_bert, train_set, params, device):
 
             for k, v in outputs.items():
                 if k in avg_losses:
-                    if i % 50 == 0:
-                        print(f'{k}: ', v.cpu().item())
+                    #if i % 50 == 0:
+                    print(f'{k}: ', v.cpu().item())
                     avg_losses[k].append(v.cpu().item())
             avg_losses["total"].append(loss.cpu().item())
+            print('total loss: ', loss.item())
             if i % 50 == 0:
                 print('loss: ', loss.item())
             #                 print('gpu processes:')
@@ -415,6 +451,7 @@ def train(extractive_bert, train_set, params, device):
             del outputs
             gc.collect()
             i += 1
+            if i == 3: break
         # if (ep % 1 == 0 or ep == params.num_epochs - 1:
 
         # Saving model
@@ -467,7 +504,8 @@ def parse_arg():
     parser = argparse.ArgumentParser()
     parser.add_argument("-task", default='ext', type=str, choices=['ext', 'abs'])
     parser.add_argument("-mode", default='train', type=str, choices=['train', 'validate', 'test'])
-    parser.add_argument("-bert_data_path", default='../data/batches_processed')
+    parser.add_argument("-bert_data_path", default='../data/cnn/cnn_final/test/')
+    parser.add_argument("-results_path", default='../data/cnn/cnn_final/results/')
     parser.add_argument("-batch_size", default=8, type=int)
     parser.add_argument("-train_steps", default=1000, type=int)
     parser.add_argument('-path_to_dataset', help='Absolute path to .json file',
@@ -496,11 +534,11 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         pass
 
-    dir_name = "../finetuned"
-    os.makedirs(os.path.dirname(dir_name), exist_ok=True)
-    model_time = datetime.datetime.now().strftime("%X")
-    model_name = f"extractivebert_last_{model_time}"
-    save_path = os.path.join(dir_name, model_name)
-    print(f"Saving trained model to directory {save_path}...")
-    extractive_bert.save_pretrained(save_path)
-    save_json(f"{save_path}/train_params.json", params.__dict__)
+    # dir_name = "../finetuned"
+    # os.makedirs(os.path.dirname(dir_name), exist_ok=True)
+    # model_time = datetime.datetime.now().strftime("%X")
+    # model_name = f"extractivebert_last_{model_time}"
+    # save_path = os.path.join(dir_name, model_name)
+    # print(f"Saving trained model to directory {save_path}...")
+    # extractive_bert.save_pretrained(save_path)
+    # save_json(f"{save_path}/train_params.json", params.__dict__)
