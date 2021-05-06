@@ -287,17 +287,6 @@ def parse_arg():
 if __name__ == '__main__':
 
     args = parse_arg()
-
-    # a = np.array([[0,0,2,0,0,2,0,0,2,0],
-    #              [2,0,0,0,2,0,0,0,0,0]])
-    #
-    # b = np.array([[0,4,4,4,0,4,0,4,4,0],
-    #              [4,0,0,0,4,4,0,4,4,0]])
-    # print('a: ', a.shape)
-    # k = b[a!=0]
-    # print(k.shape)
-    # pdb.set_trace()
-
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     # device = torch.device('cpu')
     print('Device: ', device)

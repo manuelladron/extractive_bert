@@ -124,7 +124,7 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
 
         #self.mlm = BertOnlyMLMHead(config)
         self.sent_classifier = SentClassification(config)
-        self.alig_pred = AlignmentPredictionHead(config)
+        #self.alig_pred = AlignmentPredictionHead(config)
         self.alignment = AlignmentHead(config)
 
         self.triplet_criterion = torch.nn.TripletMarginLoss(margin=0.5)
@@ -439,8 +439,8 @@ def train(extractive_bert, train_set, params, device):
 
             for k, v in outputs.items():
                 if k in avg_losses:
-                    #if i % 50 == 0:
-                    print(f'{k}: ', v.cpu().item())
+                    if i % 50 == 0:
+                        print(f'{k}: ', v.cpu().item())
                     avg_losses[k].append(v.cpu().item())
             avg_losses["total"].append(loss.cpu().item())
             print('total loss: ', loss.item())
@@ -465,7 +465,7 @@ def train(extractive_bert, train_set, params, device):
         print("***************************")
         print(f"At epoch {ep + 1}, losses: ")
         for k, v in avg_losses.items():
-            print(f"{k}: {v}")
+            print(f"{k}: {sum(v)/len(v)}")
         print("***************************")
 
 
