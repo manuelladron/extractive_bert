@@ -147,7 +147,7 @@ class ExtractiveBertTest(transformers.BertPreTrainedModel):
         return pred, gold
 
 
-def test(extractive_bert, test_set, params, device):
+def test(extractive_bert, test_set_path, params, device):
 
     # Set model in validating mode.
     def _get_ngrams(n, text):
@@ -167,21 +167,9 @@ def test(extractive_bert, test_set, params, device):
         return False
 
     torch.manual_seed(0)
-    # root = '../data/batches_processed/'
-    # print('---Loading files...')
-    # files = sorted(glob.glob(root + 'cnn_test_4_dataloader_batch_' + '[0-9]*.pkl'))
-    # datasets = list(map(lambda x: LazyDataset(x), files))
-    #
-    # dataset = torch.utils.data.ConcatDataset(datasets)
-    file = '/Users/manuelladron/iCloud_archive/Documents/_CMU/PHD-CD/spring2021/11747_neural_networks_for_NLP/project/data/cnn/cnn_final/test/cnn_test_4_dataloader_test_batch_0.pkl'
-    #f = open(file, "rb")
-    # dataset = pickle.load(f)
-    # print('testing pickle')
-    # print(dataset.iloc[0])
 
-
-    dataset = LazyDataset(file)
-
+    #file = '../data/cnn_test_4_dataloader_test_batch_0.pkl'
+    dataset = LazyDataset(test_set_path)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=params.batch_size,
@@ -189,8 +177,7 @@ def test(extractive_bert, test_set, params, device):
         collate_fn=new_collate,
     )
     del dataset
-    #del datasets
-    #del files
+
     gc.collect()
     print('loaded!')
     #print('len dataloader: ', len(dataloader))
@@ -204,7 +191,7 @@ def test(extractive_bert, test_set, params, device):
                       "doc_nmhigh_loss": [], "total": []}
         I = 0
         for ids, doc_embed, story_ids, story_labels, story_att_mask, high_ids, neg_high_ids, high_str, \
-            story_str in dataloader:
+            story_str in tqdm(dataloader):
 
             token_mask = torch.rand(story_ids.shape)
             masked_input_ids = story_ids.detach().clone()
@@ -239,11 +226,12 @@ def test(extractive_bert, test_set, params, device):
             GOLD += gold
 
             I += 1
-            if I > 6: break
+            #if I > 2: break
 
-    results_path = '/Users/manuelladron/iCloud_archive/Documents/_CMU/PHD-CD/spring2021/11747_neural_networks_for_NLP/project/data/cnn/cnn_final/results'
-    can_path = '%s_step%d.candidate' % (results_path, 99)
-    gold_path = '%s_step%d.gold' % (results_path, 99)
+    results_path = args.results_path
+    train_ep = 0
+    can_path = '%s_step%d.candidate' % (results_path, train_ep)
+    gold_path = '%s_step%d.gold' % (results_path, train_ep)
     with open(can_path, 'w') as save_pred:
         with open(gold_path, 'w') as save_gold:
             for i in range(len(gold)): # for each batch
@@ -251,15 +239,14 @@ def test(extractive_bert, test_set, params, device):
             for i in range(len(pred)):
                 save_pred.write(pred[i].strip() + '\n')
 
-    temp_dir = '/Users/manuelladron/iCloud_archive/Documents/_CMU/PHD-CD/spring2021/11747_neural_networks_for_NLP' \
-        '/project/data/cnn/cnn_final/temp'
+    temp_dir = '../data/temp/'
     rouges = test_rouge(temp_dir, can_path, gold_path)
     print('-----ROUGES------')
     print(rouge_results_to_str(rouges))
 
 class TrainParams:
     lr = 2e-5
-    batch_size = 3
+    batch_size = 12
     beta1 = 0.95
     beta2 = .999
     weight_decay = 1e-4
@@ -272,13 +259,11 @@ def parse_arg():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("-task", default='ext', type=str, choices=['ext', 'abs'])
-    parser.add_argument("-mode", default='train', type=str, choices=['train', 'validate', 'test'])
-    parser.add_argument("-bert_data_path", default='../data/cnn/cnn_final/test/')
-    parser.add_argument("-results_path", default='../data/cnn/cnn_final/results/')
-    parser.add_argument("-batch_size", default=8, type=int)
-    parser.add_argument("-train_steps", default=1000, type=int)
-    parser.add_argument('-path_to_dataset', help='Absolute path to .json file',
-                        default='../data/cnn_train.json')
+    parser.add_argument("-mode", default='test', type=str, choices=['train', 'validate', 'test'])
+    parser.add_argument("-bert_data_path", default='../data/cnn_test_4_dataloader_test_batch_0.pkl')
+    parser.add_argument("-trained_model", default='../finetuned/extractivebert_cnn_epoch_3/')
+    parser.add_argument("-results_path", default='../data/results/')
+
     parser.add_argument('-disable-cuda', action='store_true',
                         help='Disable CUDA')
     return parser.parse_args()
@@ -293,11 +278,11 @@ if __name__ == '__main__':
     params = TrainParams()
 
     print('Initiating extractive bert....')
-    extractive_bert = ExtractiveBertTest.from_pretrained('bert-base-uncased', return_dict=True)
+    print(args.trained_model)
+    extractive_bert = ExtractiveBertTest.from_pretrained(args.trained_model, return_dict=True)
 
     try:
         print('testing...')
-        #         train_(train_iter_fct, args.train_steps)
         test(extractive_bert, args.bert_data_path, params, device)
 
     except KeyboardInterrupt:
