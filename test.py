@@ -4,7 +4,7 @@ import json
 import torch.nn.functional as F
 import transformers
 from transformers import BertTokenizer, BertModel
-from transformers.models.bert.modeling_bert import BertPreTrainingHeads, BertOnlyMLMHead
+from transformers.models.bert.modeling_bert import BertPreTrainingHeads, BertOnlyMLMHead, BertLayer
 from utils import construct_bert_input, save_json
 from dataset import ExtractiveDataset, new_collate, load_dataset, DataloaderMultiple, LazyDataset
 from tqdm import tqdm
@@ -19,9 +19,10 @@ import psutil
 from utils import print_memory
 from others.utils import test_rouge, rouge_results_to_str
 import numpy as np
+from sklearn.neighbors import NearestNeighbors
 
 
-class SentClassification(torch.nn.Module):
+class SentClassification_1layer(torch.nn.Module):
     """
     Use to calculate 1 objectivves:
         - Sequence prediction: whether the [CLS] tokens of each sent should be included as summary
@@ -29,13 +30,34 @@ class SentClassification(torch.nn.Module):
     """
     def __init__(self, config):
         super().__init__()
+        self.bertlayer = BertLayer(config)
         self.seq_relationship = torch.nn.Linear(config.hidden_size, 1)
 
     def forward(self, sentence_output):
-        sent_pred_score = self.seq_relationship(sentence_output)
+        bert_output = self.bertlayer(sentence_output)
+        sent_pred_score = self.seq_relationship(bert_output[0])
         return sent_pred_score
 
+class SentClassification(torch.nn.Module):
+    """
+    Use to calculate 1 objective:
+        - Sequence prediction: whether the [CLS] tokens of each sent should be included as summary
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.bertlayer1 = BertLayer(config)
+        self.bertlayer2 = BertLayer(config)
+        self.seq_relationship = torch.nn.Linear(config.hidden_size, 2)
 
+    def forward(self, sentence_output):
+        bert_output = self.bertlayer1(sentence_output)
+        bert_output = self.bertlayer2(bert_output[0])
+        
+        sent_pred_score = self.seq_relationship(bert_output[0])
+        return sent_pred_score    
+    
+    
+    
 class AlignmentPredictionHead(torch.nn.Module):
     """
     Use to calculate 2 objectivves:
@@ -65,7 +87,6 @@ class ExtractiveBertTest(transformers.BertPreTrainedModel):
         #self.mlm = BertOnlyMLMHead(config)
         self.sent_classifier = SentClassification(config)
         #self.alig_pred = AlignmentPredictionHead(config) # sent classification and doc-sents alignment
-        #self.init_weights()
 
     def forward(
             self,
@@ -89,7 +110,7 @@ class ExtractiveBertTest(transformers.BertPreTrainedModel):
                             return_dict=True)
 
         sequence_output = outputs.last_hidden_state  # [batch, 512, 768]
-        #doc_output = sequence_output[:, 0, :]
+        doc_output = sequence_output[:, 0, :]
 
         # Mask all tokens that are not [CLS] to calculate alignment loss
         sequence_output_ = torch.clone(sequence_output).detach()
@@ -110,9 +131,17 @@ class ExtractiveBertTest(transformers.BertPreTrainedModel):
             story_labels_b = story_labels[b, :]            # [num_sents]
             # Now get only CLS tokens
             only_cls_scores = sent_scores_b[stories_cls_b != -100]
-            # Now do BCE loss
+            ## If using BCE Loss comment the line below
+            only_cls_scores = torch.max(only_cls_scores, dim=1)[0]
+            #pdb.set_trace()
             labels = story_labels_b[:only_cls_scores.shape[0]].float()
+            
+            # Loss with BCE
             loss_b = F.binary_cross_entropy_with_logits(only_cls_scores.squeeze(), labels)
+            # Loss with CE
+            #loss_fct = torch.nn.CrossEntropyLoss()
+            #pdb.set_trace()
+            #loss_b = loss_fct(only_cls_scores, labels.long())
             losses += loss_b
 
             # Now select ids from candidates and labels
@@ -120,25 +149,39 @@ class ExtractiveBertTest(transformers.BertPreTrainedModel):
             labels_ids = torch.where(labels == 1)[0]
             b_candidates_ids.append(selected_ids.cpu().numpy())
             b_labels_ids.append(labels_ids.cpu().numpy())
-
+            
+            ## Candidates via nearest neighbors 
+            # Get label predictions (K-neighbors words of the image embedding)
+#             neigh = NearestNeighbors(n_neighbors=3) # initilize algorithm
+#             # Get embeddings 
+#             sequence_output_b = sequence_output[b, :, :]
+#             # Get only [CLS] tokens 
+#             sequence_output_b = sequence_output_b[stories_cls_b == 101]
+#             neigh.fit(sequence_output_b.cpu().numpy())           # fit population (words)
+#             d, wids = neigh.kneighbors(doc_output[b].view(1, -1).cpu().numpy())   # find the 10 nearest words to the image
+#             selected_ids = wids.squeeze()#.tolist() # array of indices type Long (int)
+            
+            #pdb.set_trace()
+            
             _pred = []
             for i, idx in enumerate(selected_ids):
-
+                #pdb.set_trace()
                 if len(story_str[b][idx]) == 0:
                     continue
                 candidate = story_str[b][idx].strip()
                 _pred.append(candidate)
                 if len(_pred) == 3:
                     break
+#             _pred = '<q>'.join(_pred)
+#             pred.append(_pred)
 
-            #_pred = '<q>'.join(_pred)
-            #pred.append(_pred)
             _gold = high_str[b][:3]
             if len(_gold) < len(_pred):
                 _pred = _pred[:len(_gold)]
             elif len(_gold) > len(_pred):
                 _gold = _gold[:len(_pred)]
-
+            
+            assert(len(_gold) == len(_pred))
             pred += _pred
             gold += _gold
 
@@ -234,10 +277,10 @@ def test(extractive_bert, test_set_path, params, device):
     gold_path = '%s_step%d.gold' % (results_path, train_ep)
     with open(can_path, 'w') as save_pred:
         with open(gold_path, 'w') as save_gold:
-            for i in range(len(gold)): # for each batch
-                save_gold.write(gold[i].strip() + '\n')
-            for i in range(len(pred)):
-                save_pred.write(pred[i].strip() + '\n')
+            for i in range(len(GOLD)): # for each batch
+                save_gold.write(GOLD[i].strip() + '\n')
+            for i in range(len(PRED)):
+                save_pred.write(PRED[i].strip() + '\n')
 
     temp_dir = '../data/temp/'
     rouges = test_rouge(temp_dir, can_path, gold_path)
@@ -261,7 +304,7 @@ def parse_arg():
     parser.add_argument("-task", default='ext', type=str, choices=['ext', 'abs'])
     parser.add_argument("-mode", default='test', type=str, choices=['train', 'validate', 'test'])
     parser.add_argument("-bert_data_path", default='../data/cnn_test_4_dataloader_test_batch_0.pkl')
-    parser.add_argument("-trained_model", default='../finetuned/extractivebert_cnn_epoch_3/')
+    parser.add_argument("-trained_model", default='../finetuned/extractivebert_last_11:39:57/')
     parser.add_argument("-results_path", default='../data/results/')
 
     parser.add_argument('-disable-cuda', action='store_true',

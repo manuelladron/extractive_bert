@@ -16,7 +16,7 @@ from PIL import Image
 import transformers
 from transformers import AdamW
 from transformers import BertTokenizer, BertModel
-from transformers.models.bert.modeling_bert import BertPreTrainingHeads, BertOnlyMLMHead
+from transformers.models.bert.modeling_bert import BertPreTrainingHeads, BertOnlyMLMHead, BertLayer
 from transformers import get_linear_schedule_with_warmup
 
 from dataset import ExtractiveDataset, new_collate, load_dataset, DataloaderMultiple, LazyDataset
@@ -36,18 +36,19 @@ import numpy as np
 
 def adaptive_loss(outputs):
     # masked_lm_loss = outputs['masked_lm_loss']
-    sent_pred_loss = outputs['sent_pred_loss']
+    sent_class_loss = outputs['sent_class_loss']
     doc_story_alig_loss = outputs['doc_story_loss']
     doc_high_alig_loss = outputs['doc_high_loss']
-    doc_nmhigh_alig_loss = outputs['doc_nmhigh_loss']
+    doc_nmhigh_alig_loss = outputs['doc_nonhigh_loss']
+    triplet_loss = outputs['triplet_loss']
 
-    G = torch.stack([sent_pred_loss, doc_story_alig_loss, doc_high_alig_loss, doc_nmhigh_alig_loss])  # [5]
-    # G = torch.stack([masked_lm_loss, sent_pred_loss, doc_story_alig_loss, doc_high_alig_loss, doc_nmhigh_alig_loss])  #[5]
+#     G = torch.stack([sent_pred_loss, doc_story_alig_loss, doc_high_alig_loss, doc_nmhigh_alig_loss])  # [5]
+    G = torch.stack([sent_class_loss, doc_story_alig_loss, doc_high_alig_loss, doc_nmhigh_alig_loss, triplet_loss])  #[5]
     w0 = 1.0
     w1 = 1.0
     w2 = 1.0
     w3 = 1.0
-    # w4 = 1.0
+    w4 = 1.0
 
     isAdaptive = True
     if isAdaptive:
@@ -55,24 +56,24 @@ def adaptive_loss(outputs):
         nG = logits * logits
         alpha = 1.0
         K = 5.0
-        #         denominator = (alpha * K - nG[0]) * (alpha * K - nG[1]) + (alpha * K - nG[1]) * (alpha * K - nG[2]) + (
-        #                     alpha * K - nG[2]) * (alpha * K - nG[3]) + (alpha * K - nG[3]) * (alpha * K - nG[4]) + (alpha * K - nG[4]) * (alpha * K - nG[0])
         denominator = (alpha * K - nG[0]) * (alpha * K - nG[1]) + (alpha * K - nG[1]) * (alpha * K - nG[2]) + (
-                alpha * K - nG[2]) * (alpha * K - nG[3]) + (alpha * K - nG[3]) * (alpha * K - nG[0])
+        alpha * K - nG[2]) * (alpha * K - nG[3]) + (alpha * K - nG[3]) * (alpha * K - nG[4]) + (alpha * K - nG[4]) * (alpha * K - nG[0])
+#         denominator = (alpha * K - nG[0]) * (alpha * K - nG[1]) + (alpha * K - nG[1]) * (alpha * K - nG[2]) + (
+#                 alpha * K - nG[2]) * (alpha * K - nG[3]) + (alpha * K - nG[3]) * (alpha * K - nG[0])
 
-        w0 = (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3]) / denominator
-        w1 = (alpha * K - nG[2]) * (alpha * K - nG[0]) * (alpha * K - nG[3]) / denominator
-        w2 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[3]) / denominator
-        w3 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2]) / denominator
+#         w0 = (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3]) / denominator
+#         w1 = (alpha * K - nG[2]) * (alpha * K - nG[0]) * (alpha * K - nG[3]) / denominator
+#         w2 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[3]) / denominator
+#         w3 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2]) / denominator
 
-        #         w0 = (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3]) * (alpha * K - nG[4]) / denominator
-        #         w1 = (alpha * K - nG[2]) * (alpha * K - nG[0]) * (alpha * K - nG[3]) * (alpha * K - nG[4]) / denominator
-        #         w2 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[3]) * (alpha * K - nG[4]) / denominator
-        #         w3 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[4]) / denominator
-        #         w4 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3]) / denominator
+        w0 = (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3]) * (alpha * K - nG[4]) / denominator
+        w1 = (alpha * K - nG[2]) * (alpha * K - nG[0]) * (alpha * K - nG[3]) * (alpha * K - nG[4]) / denominator
+        w2 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[3]) * (alpha * K - nG[4]) / denominator
+        w3 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[4]) / denominator
+        w4 = (alpha * K - nG[0]) * (alpha * K - nG[1]) * (alpha * K - nG[2]) * (alpha * K - nG[3]) / denominator
 
         #     adaptive_loss = w0 * masked_lm_loss + w1 * sent_pred_loss + w2 * doc_story_alig_loss + w3 * doc_high_alig_loss + w4 * doc_nmhigh_alig_loss
-        adaptive_loss = w0 * sent_pred_loss + w1 * doc_story_alig_loss + w2 * doc_high_alig_loss + w3 * doc_nmhigh_alig_loss
+        adaptive_loss = w0 * sent_class_loss + w1 * doc_story_alig_loss + w2 * doc_high_alig_loss + w3 * doc_nmhigh_alig_loss + w4 * triplet_loss
 
     return adaptive_loss
 
@@ -93,10 +94,15 @@ class SentClassification(torch.nn.Module):
     """
     def __init__(self, config):
         super().__init__()
-        self.seq_relationship = torch.nn.Linear(config.hidden_size, 1)
+        self.bertlayer1 = BertLayer(config)
+        self.bertlayer2 = BertLayer(config)
+        self.seq_relationship = torch.nn.Linear(config.hidden_size, 2)
 
     def forward(self, sentence_output):
-        sent_pred_score = self.seq_relationship(sentence_output)
+        bert_output = self.bertlayer1(sentence_output)
+        bert_output = self.bertlayer2(bert_output[0])
+        
+        sent_pred_score = self.seq_relationship(bert_output[0])
         return sent_pred_score
 
 
@@ -217,26 +223,30 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
         sequence_output_[stories_cls_tokens_mask == -100] = -100
 
         # Calculate sentence classification
-        sent_scores  = self.sent_classifier(sequence_output_)  # [batch, 512,
-        # 1] and [batch, 1]
+        sent_scores  = self.sent_classifier(sequence_output_)  # [batch, 512, 1] 
         sent_class_loss = 0
+        
         for b in range(batch_size):
             sent_scores_b = sent_scores[b, :, :]  # [512, 1]
             stories_cls_b = stories_cls_tokens_mask[b, :]  # [512]
             story_labels_b = story_labels[b, :]  # [num_sents]
             # Now get only CLS tokens
-            only_cls_scores = sent_scores_b[stories_cls_b != -100]
+            only_cls_scores = sent_scores_b[stories_cls_b != -100] # [batch, 2]
             # Now do BCE loss
-            labels = story_labels_b[:only_cls_scores.shape[0]].float()
+            labels = story_labels_b[:only_cls_scores.shape[0]].long()
+            #pdb.set_trace()
             try:
-                loss_b = F.binary_cross_entropy_with_logits(only_cls_scores.squeeze(), labels)
+                loss_fct = torch.nn.CrossEntropyLoss()
+                loss_b = loss_fct(only_cls_scores, labels)
+                #pdb.set_trace()
+                #loss_b = F.binary_cross_entropy_with_logits(only_cls_scores.squeeze(), labels)
             except:
                 print('len labels: ', labels.shape)
                 print('len scores: ', only_cls_scores.shape)
                 continue
             sent_class_loss += loss_b
 
-        sent_class_loss /=  batch_size
+        sent_class_loss /= batch_size
 
         # Calculate alignment
         # With all tokens 
@@ -272,10 +282,11 @@ class ExtractiveBert(transformers.BertPreTrainedModel):
 
         ######## Calculate triplet loss
         # Anchor is story, Positive is high, Negative is non-high
-        anchor = sequence_output[stories_cls_tokens_mask == 101]
+        #anchor = sequence_output[stories_cls_tokens_mask == 101]
+        anchor = doc_output
         pos = sequence_output_high[pos_high_cls_tokens_mask == 101]
         neg = sequence_output_nonhigh[neg_high_cls_tokens_mask == 101]
-        
+
         a_len = anchor.shape[0]
         p_len = pos.shape[0]
         n_len = neg.shape[0]
@@ -350,7 +361,7 @@ def train(extractive_bert, data_path, params, device):
     #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/extractivebert'),
     #     ) as profiler:
     for ep in range(params.num_epochs):
-        ep += 2
+        #ep += 2
         print('epoch: ', ep)
         avg_losses = {"sent_class_loss": [], "doc_story_loss": [], "doc_high_loss": [],
                       "doc_nonhigh_loss": [], "triplet_loss": [], "total": []}
@@ -434,13 +445,13 @@ def train(extractive_bert, data_path, params, device):
                 device=device
             )
 
-            loss = 2 * outputs['sent_class_loss'] \
-                   + 1 * outputs['doc_story_loss'] \
-                   + 1 * outputs['doc_high_loss'] \
-                   + 1 * outputs['doc_nonhigh_loss'] \
-                   + 1 * outputs["triplet_loss"]
+#             loss = 2 * outputs['sent_class_loss'] \
+#                    + 1 * outputs['doc_story_loss'] \
+#                    + 1 * outputs['doc_high_loss'] \
+#                    + 1 * outputs['doc_nonhigh_loss'] \
+#                    + 1 * outputs["triplet_loss"]
 
-            # loss = adaptive_loss(outputs)
+            loss = adaptive_loss(outputs)
             # print('adaptive loss: ', loss.item())
             loss.backward()
             opt.step()
@@ -515,7 +526,7 @@ def parse_arg():
     parser.add_argument("-task", default='ext', type=str, choices=['ext', 'abs'])
     parser.add_argument("-mode", default='train', type=str, choices=['train', 'validate', 'test'])
     parser.add_argument("-bert_data_path", default='../data/all_train_files/')
-    parser.add_argument("-train_from", default='../finetuned/extractivebert_cnn_epoch_0/')
+    parser.add_argument("-train_from", default=None)
     parser.add_argument("-results_path", default='../data/results/')
     parser.add_argument("-batch_size", default=12, type=int)
     parser.add_argument("-train_steps", default=1000, type=int)
